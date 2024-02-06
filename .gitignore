@@ -3,3 +3,4 @@ build/
 error.txt
 stdexec-main
 asio
+main.cpp
