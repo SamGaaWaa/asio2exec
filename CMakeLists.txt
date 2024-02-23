@@ -20,7 +20,7 @@ foreach(EXAMPLE_SOURCE ${EXAMPLE_SOURCES})
     # 生成可执行文件
     add_executable(${EXAMPLE_NAME} ${EXAMPLE_SOURCE})
     target_include_directories(${EXAMPLE_NAME} PUBLIC "asio/asio/include")
-    target_include_directories(${EXAMPLE_NAME} PUBLIC "stdexec-main/include")
+    target_include_directories(${EXAMPLE_NAME} PUBLIC "stdexec/include")
     target_include_directories(${EXAMPLE_NAME} PUBLIC ".")
 endforeach()
 

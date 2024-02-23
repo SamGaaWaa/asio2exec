@@ -43,9 +43,7 @@ int main(int argc, char **argv){
                                                     s.async_read_some(asio::buffer(buf.data(), buf.size()), use_sender),
                                                     timer.async_wait(use_sender) | ex::let_value([](auto){ return ex::just_stopped(); })
                                                 ) |
-                                                ex::into_variant() |
-                                                ex::then([](std::variant<std::tuple<asio::error_code, size_t>> res){
-                                                    auto [ec, n] = std::get<0>(res);
+                                                ex::then([](asio::error_code ec, size_t n){
                                                     if(ec)
                                                         throw asio::system_error{ec};
                                                     return n;
@@ -58,9 +56,9 @@ int main(int argc, char **argv){
                                                                 asio::async_write(s, asio::buffer(buf.data(), n), use_sender),
                                                                 timer.async_wait(use_sender) | ex::let_value([](auto){ return ex::just_stopped(); })
                                                             ) |
-                                                            ex::into_variant() |
-                                                            ex::then([&](auto res){
-                                                                auto [ec, _] = std::get<0>(res);
+                                                            ex::then([&](asio::error_code ec, size_t n){
+                                                                if(n == 0)
+                                                                    return true;
                                                                 if(ec)
                                                                     throw asio::system_error{ec};
                                                                 return !s.is_open();

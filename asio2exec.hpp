@@ -1,21 +1,24 @@
 #pragma once
 
+#include "stdexec/execution.hpp"
 #include "asio/async_result.hpp"
 #include "asio/error_code.hpp"
 #include "asio/io_context.hpp"
 #include "asio/cancellation_signal.hpp"
 #include "asio/associated_executor.hpp"
 #include "asio/post.hpp"
-#include "stdexec/execution.hpp"
-#include <thread>
-#include <type_traits>
 #include "asio/bind_executor.hpp"
 #include "asio/bind_allocator.hpp"
+#include "asio/as_tuple.hpp"
 #include <memory_resource>
+#include <thread>
+#include <type_traits>
 #include <cassert>
 #include <format>
 #include <optional>
+#include <iostream>
 #include <atomic>
+#include <utility>
 
 #define STDEXEC stdexec
 #define ASIO asio
@@ -114,20 +117,15 @@ public:
 
 private:
     void* do_allocate(size_t bytes, size_t alignment) override{
-        // std::cout << std::format("Allocate:{} bytes, Alignment:{}, buffer size:{}, buffer alignment:{}\n", bytes, alignment, sizeof(_storage), alignof(T));
         if(_used || bytes > Size || alignment > Alignment){
-            // std::cout << "Can not optimize $$$$$$$$$$$$$$$$$$$$$$$$$$$\n";
-            // std::terminate();
             assert(("Upstream memory_resource is empty.", _upstream));
             return _upstream->allocate(bytes, alignment);
         }
-        // std::cout << "Optimize ########################################\n";
         _used = true;
         return &_storage;
     }
 
     void do_deallocate(void* ptr, size_t bytes, size_t alignment) override {
-        // std::cout << "My deallocate.\n";
         if(ptr == &_storage){
             _used = false;
             return;
@@ -211,7 +209,6 @@ struct scheduler_t {
                 if constexpr(!STDEXEC::unstoppable_token<STDEXEC::stop_token_of_t<STDEXEC::env_of_t<R>>>){
                     const STDEXEC::stoppable_token auto st = STDEXEC::get_stop_token(STDEXEC::get_env(self._r));
                     if(st.stop_requested()){
-                        // std::cout << "Stop before scheduled.\n";
                         STDEXEC::set_stopped(std::move(self._r));
                         return;
                     }
@@ -245,15 +242,12 @@ struct scheduler_t {
     
 template<class T>
 struct use_sender_handler_base {
-    // using executor_type = asio::io_context::executor_type;
     using allocator_type = std::pmr::polymorphic_allocator<>;
 
     T* op;
     allocator_type allocator;
 
     allocator_type get_allocator() const noexcept { return allocator; }
-
-    // const executor_type& get_executor() const noexcept { return _ex; }
 
     template<class ..._Args>
     void operator()(_Args&& ...args) {
@@ -275,6 +269,62 @@ consteval size_t __get_args_size(){
     else return (sizeof(Args) + ...);
 }
 
+template<class T>
+concept __is_tuple = requires (T&& t){
+    std::get<0>(t);
+}; 
+
+template<class T>
+constexpr auto& __unwrap_first(T& t)noexcept{
+    return t;
+}
+
+template<__is_tuple T>
+constexpr auto& __unwrap_first(T& t)noexcept{
+    using __first_t = typename std::tuple_element<0, T>::type;
+    return __unwrap_first<__first_t>(std::get<0>(t));
+}
+
+template<class T>
+using __unwrap_first_t = std::decay_t<decltype(__unwrap_first(std::declval<T>()))>;
+
+template<__is_tuple T>
+constexpr auto&& __unwrap_tuple(T&& t)noexcept{
+    if constexpr(std::tuple_size<T>{} == size_t(1)){
+        return __unwrap_tuple(std::get<0>(std::forward<T>(t)));
+    }else{
+        return std::forward<T>(t);
+    }
+}
+
+template<class T>
+constexpr auto&& __unwrap_tuple(T&& t)noexcept{
+    return std::make_tuple(std::forward<T>(t));
+}
+
+template <class _Fn>
+    requires std::is_nothrow_move_constructible_v<_Fn>
+struct __conv {
+    _Fn __fn_;
+    using __t = std::invoke_result_t<_Fn>;
+
+    operator __t() && noexcept(std::is_nothrow_invocable_v<_Fn>) {
+        return ((_Fn&&) __fn_)();
+    }
+
+    __t operator()() && noexcept(std::is_nothrow_invocable_v<_Fn>) {
+        return ((_Fn&&) __fn_)();
+    }
+};
+
+template <class _Fn>
+__conv(_Fn) -> __conv<_Fn>;
+
+template<class T>
+constexpr std::string_view type_name(){
+    return {__PRETTY_FUNCTION__};
+}
+
 }// __detail
 
 __detail::scheduler_t asio_context::get_scheduler()noexcept { return __detail::scheduler_t{ this }; }
@@ -294,7 +344,7 @@ namespace ASIO {
 
             template<class Init, STDEXEC::receiver R>
             struct __operation_base {
-                using __res_t = std::conditional_t<sizeof...(Args) == 0, bool, std::optional<std::tuple<Args...>>>;
+                using __res_t = std::optional<std::tuple<Args...>>;
                 Init init;
                 std::tuple<InitArgs...> args;
                 R _r;
@@ -321,10 +371,7 @@ namespace ASIO {
 
                     void operator()()noexcept{
                         if constexpr(std::is_same_v<Tag, STDEXEC::set_value_t>){
-                            if constexpr(std::is_same_v<__operation_base::__res_t, bool>){
-                                STDEXEC::set_value(std::move(self->_r));
-                            }else
-                                std::apply(STDEXEC::set_value, std::tuple_cat(std::make_tuple(std::move(self->_r)), std::move(*self->_res)));
+                            std::apply(STDEXEC::set_value, std::tuple_cat(std::make_tuple(std::move(self->_r)), std::move(*self->_res)));
                         }else if constexpr(std::is_same_v<Tag, STDEXEC::set_error_t>){
                             STDEXEC::set_error(std::move(self->_r), std::move(self->_err));
                         }else if constexpr(std::is_same_v<Tag, STDEXEC::set_stopped_t>){
@@ -345,10 +392,7 @@ namespace ASIO {
                         });
                         return;
                     }
-                    if constexpr(std::is_same_v<__res_t, bool>){
-                        STDEXEC::set_value(std::move(_r));
-                    }else
-                        std::apply(STDEXEC::set_value, std::tuple_cat(std::make_tuple(std::move(_r)), std::move(*_res)));
+                    std::apply(STDEXEC::set_value, std::tuple_cat(std::make_tuple(std::move(_r)), std::move(*_res)));
                 }
 
                 void __stop()noexcept{
@@ -373,8 +417,6 @@ namespace ASIO {
                     STDEXEC::set_error(std::move(_r), std::move(_err));
                 }
 
-                // template<class T>
-                //     requires std::is_base_of_v<__operation_base, T>
                 void __init()noexcept{
                     std::apply(
                         [this](InitArgs&& ...init_args) {
@@ -392,13 +434,12 @@ namespace ASIO {
 
                 template<class ..._Args>
                 void complete(_Args&& ...args)noexcept {
-                    if constexpr(!std::is_same_v<__res_t, bool>){
-                        _res.emplace(std::forward<_Args>(args)...);
-                        if constexpr(std::is_same_v<std::decay_t<decltype(std::get<0>(*_res))>, asio::error_code>){
-                            if(std::get<0>(*_res) == ASIO::error::operation_aborted){
-                                __stop();
-                                return;
-                            }
+                    _res.emplace(std::forward<_Args>(args)...);
+                    using __first_t = asio2exec::__detail::__unwrap_first_t<decltype(*_res)>;
+                    if constexpr(std::is_same_v<__first_t, asio::error_code>){
+                        if(asio2exec::__detail::__unwrap_first(*_res) == ASIO::error::operation_aborted){
+                            __stop();
+                            return;
                         }
                     }
                     __value();
@@ -425,7 +466,6 @@ namespace ASIO {
                         __state_t expected = self->_state.load(std::memory_order_relaxed);
                         while(!self->_state.compare_exchange_weak(expected, __state_t::stopped, std::memory_order_acq_rel))
                         {}
-                        // std::cout << "$$$$$$$$$$$$$$$$:" << size_t(self) << '\n';
                         if(expected == __state_t::initiated){
                             self->_signal.emit(ASIO::cancellation_type_t::total);
                         }
@@ -464,15 +504,12 @@ namespace ASIO {
                 {
                     const auto st = STDEXEC::get_stop_token(STDEXEC::get_env(self._r));
                     if(st.stop_requested()){
-                        // std::cout << "Stop1.\n";
                         self.__stop();
                         return;
                     }
                     self._stop_callback.emplace(st, __stop_t{&self});
                     __state_t expected = __state_t::construction;
                     if(!self._state.compare_exchange_strong(expected, __state_t::emplaced, std::memory_order_acq_rel)){
-                        // 初始化IO操作前已经请求取消, stop_callback已调用
-                        // std::cout << "Stop2.\n";
                         self._stop_callback.reset();
                         self.__stop();
                         return;
@@ -490,12 +527,10 @@ namespace ASIO {
                     expected = __state_t::emplaced;
                     if(!self._state.compare_exchange_strong(expected, __state_t::initiated, std::memory_order_acq_rel)){
                         // 已经请求取消，但stop_callback不会发出取消信号（见__stop_t的if分支）
-                        // std::cout << "Stop3.\n";
                         self._stop_callback.reset();
                         self._signal.emit(ASIO::cancellation_type_t::total);
                         return;
                     }
-                    // std::cout << "Initiate normally.\n";
                 }
             };
 
@@ -574,7 +609,7 @@ namespace ASIO {
             friend STDEXEC::operation_state auto tag_invoke(STDEXEC::connect_t, __sender&& self, R&& r)
             {
                 const auto env = STDEXEC::get_env(r);
-                const auto sched = STDEXEC::get_scheduler(env);
+                auto sched = STDEXEC::get_scheduler(env);
 
                 if constexpr(std::is_same_v<std::decay_t<decltype(sched)>, asio2exec::asio_context::scheduler_t>){
                     const auto& ex = sched._ctx->get_executor().get_executor();
@@ -608,6 +643,110 @@ namespace ASIO {
                 }
             }
 
+            STDEXEC::sender auto __to_single()&& noexcept {
+                return  std::move(*this) |
+                        STDEXEC::then([]<class ..._Args>(_Args&&...args){
+                            auto res = asio2exec::__detail::__unwrap_tuple(std::make_tuple(std::forward<_Args>(args)...));
+                            using __res_t = decltype(res);
+                            using __first_t = std::decay_t<std::tuple_element_t<0, __res_t>>;
+                            constexpr size_t n = std::tuple_size<__res_t>{};
+                            if constexpr(n == 1){
+                                if constexpr(std::is_same_v<__first_t, asio::error_code>){
+                                    const auto& ec = std::get<0>(res);
+                                    if(ec)
+                                        throw asio::system_error{ec};
+                                    return;
+                                }else {
+                                    return std::get<0>(std::move(res));
+                                }
+                            }else if constexpr(n == 2){
+                                if constexpr(std::is_same_v<__first_t, asio::error_code>){
+                                    const auto& ec = std::get<0>(res);
+                                    if(ec)
+                                        throw asio::system_error{ec};
+                                    return std::get<1>(std::move(res));
+                                }else{
+                                    static_assert(false, "Sender with such completion signature can not transform to awaitable. Try to use \"asio::as_tuple\"");
+                                }
+                            }else{
+                                static_assert(false, "Sender with such completion signature can not transform to awaitable. Try to use \"asio::as_tuple\"");
+                            }
+                        });
+            }
+
+            // template<class Promise>
+            //     requires std::is_base_of_v<STDEXEC::with_awaitable_senders, Promise>
+            // struct __awaitable_receiver_t{
+            //     using receiver_concept = STDEXEC::receiver_t;
+            //     Awaitable *_await;
+            //     Promise *_promise;
+
+            //     template<class _T>
+            //         requires std::is_nothrow_convertible_v<_T, T>
+            //     friend void tag_invoke(STDEXEC::set_value_t, __awaitable_receiver_t&& R, _T&& t)noexcept{
+            //         R._await->template _res.emplace(std::forward<_T>(t));
+            //         R._await->template _h.resume();
+            //     }
+
+            //     friend void tag_invoke(STDEXEC::set_error_t, __awaitable_receiver_t&& R, std::exception_ptr err)noexcept{
+            //         R._await->template _err = std::move(err);
+            //         R._await->template _h.resume();
+            //     }
+
+            //     friend void tag_invoke(STDEXEC::set_stopped_t, __awaitable_receiver_t&& R)noexcept{
+            //         R._promise->template unhandled_stopped();
+            //     }
+            // };
+
+            // template<STDEXEC::sender Snd, STDEXEC::operation_state St, class T>
+            // struct __awaitable_t {
+            //     Snd _s;
+            //     std::coroutine_handle<> _h{};
+            //     std::optional<St> _state{};
+            //     std::optional<T> _res{};
+            //     std::exception_ptr _err{};
+
+            //     bool await_ready()const noexcept{ return false; }
+
+            //     template<class CoroHandle>
+            //     bool await_suspend(CoroHandle h){
+            //         using __promise_t = decltype(h.promise());
+            //         _h = h;
+            //         __receiver_t<__awaitable_t, __promise_t> r{this, &h.promise()};
+            //         _state.emplace(asio2exec::__detail::__conv{[r, s = std::move(_s)]()mutable{
+            //             return STDEXEC::connect(std::move(s), std::move(r));
+            //         }});
+            //         STDEXEC::start(*_state);
+            //         return true;
+            //     }
+
+            //     T await_resume()noexcept{
+            //         if(_err)
+            //             std::rethrow_exception(_err);
+            //         return std::move(*_res);
+            //     }
+
+            // };
+
+            // struct __debug_awaitable{
+            //     bool await_ready(){ return false; }
+                
+            //     template<class CoroHandle>
+            //     bool await_suspend(CoroHandle h){
+            //         std::cout << typeid(h.template promise()).name() << '\n';
+            //         return false;
+            //     }
+
+            //     int await_resume(){
+            //         return 2;
+            //     }
+            // };
+
+            // template<class Promise>
+            // friend auto tag_invoke(STDEXEC::as_awaitable_t, __sender&&, Promise&)noexcept{
+            //     return __debug_awaitable{};
+            // }
+
             using __completion_signatures = STDEXEC::completion_signatures<
                 STDEXEC::set_value_t(Args...),
                 STDEXEC::set_error_t(std::exception_ptr),
@@ -632,6 +771,7 @@ namespace ASIO {
                 .args{std::move(args)...} 
             };
         }
+
     };
 
 } // ASIO
