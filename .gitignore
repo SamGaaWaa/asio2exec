@@ -1,7 +1,3 @@
 .vscode/
 build/
-error.txt
-stdexec-main
 stdexec
-asio
-main.cpp
