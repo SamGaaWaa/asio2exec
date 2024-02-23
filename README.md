@@ -28,7 +28,7 @@ int main() {
 ```
 ---
 **Note:**
-The io operations of asio's io objects(timer, socket) are always performed in the context which construct the io object, but subsequent operations are guaranteed at the correct scheduler.
+The io operations of asio's io objects(timer, socket) are always performed in the context which used to construct the io object, but subsequent operations are guaranteed at the correct scheduler.
 
 ```c++
 asio2exec::asio_context ctx1;
