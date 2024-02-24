@@ -1,6 +1,11 @@
-Adapting ASIO to [P2300 execution](https://github.com/NVIDIA/stdexec)
+A single header. Adapt [ASIO](https://github.com/chriskohlhoff/asio) to [P2300 execution](https://github.com/NVIDIA/stdexec)
 
-**Example**
+**Usage:**
+- namespace **asio2exec**
+- **asio_context** 
+- completion token **use_sender** makes asynchronous functions return a **sender**
+
+**Example:**
 ```c++
 #include "stdexec/execution.hpp"
 #include "asio2exec.hpp"
@@ -26,7 +31,11 @@ int main() {
 }
 
 ```
----
+**Configure:**
+
+To use Boost.Asio, define **ASIO_USE_BOOST**
+
+
 **Note:**
 The io operations of asio's io objects(timer, socket) are always performed in the context which used to construct the io object, but subsequent operations are guaranteed at the correct scheduler.
 
