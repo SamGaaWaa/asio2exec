@@ -22,7 +22,7 @@
 
 #pragma once
 
-#include "stdexec/execution.hpp"
+#if !defined(ASIO_USE_BOOST)
 #include "asio/async_result.hpp"
 #include "asio/error_code.hpp"
 #include "asio/io_context.hpp"
@@ -31,16 +31,32 @@
 #include "asio/post.hpp"
 #include "asio/bind_executor.hpp"
 #include "asio/bind_allocator.hpp"
+#else
+#include "boost/asio/async_result.hpp"
+#include "boost/asio/io_context.hpp"
+#include "boost/asio/cancellation_signal.hpp"
+#include "boost/asio/associated_executor.hpp"
+#include "boost/asio/post.hpp"
+#include "boost/asio/bind_executor.hpp"
+#include "boost/asio/bind_allocator.hpp"
+#endif
+
+#include "stdexec/execution.hpp"
+
+#include <atomic>
+#include <cassert>
 #include <memory_resource>
+#include <optional>
 #include <thread>
 #include <type_traits>
-#include <cassert>
-#include <optional>
-#include <atomic>
 #include <utility>
 
 #define STDEXEC stdexec
+#if !defined(ASIO_USE_BOOST)
 #define ASIO asio
+#else
+#define ASIO boost::asio
+#endif
 
 namespace asio2exec {
 
@@ -455,8 +471,8 @@ namespace ASIO {
                 void complete(_Args&& ...args)noexcept {
                     _res.emplace(std::forward<_Args>(args)...);
                     using __first_t = asio2exec::__detail::__unwrap_first_t<decltype(*_res)>;
-                    if constexpr(std::is_same_v<__first_t, asio::error_code>){
-                        if(asio2exec::__detail::__unwrap_first(*_res) == ASIO::error::operation_aborted){
+                    if constexpr(std::is_convertible_v<__first_t, std::error_code>){
+                        if(asio2exec::__detail::__unwrap_first(*_res) == std::errc::operation_canceled){
                             __stop();
                             return;
                         }
@@ -662,36 +678,36 @@ namespace ASIO {
                 }
             }
 
-            STDEXEC::sender auto __to_single()&& noexcept {
-                return  std::move(*this) |
-                        STDEXEC::then([]<class ..._Args>(_Args&&...args){
-                            auto res = asio2exec::__detail::__unwrap_tuple(std::make_tuple(std::forward<_Args>(args)...));
-                            using __res_t = decltype(res);
-                            using __first_t = std::decay_t<std::tuple_element_t<0, __res_t>>;
-                            constexpr size_t n = std::tuple_size<__res_t>{};
-                            if constexpr(n == 1){
-                                if constexpr(std::is_same_v<__first_t, asio::error_code>){
-                                    const auto& ec = std::get<0>(res);
-                                    if(ec)
-                                        throw asio::system_error{ec};
-                                    return;
-                                }else {
-                                    return std::get<0>(std::move(res));
-                                }
-                            }else if constexpr(n == 2){
-                                if constexpr(std::is_same_v<__first_t, asio::error_code>){
-                                    const auto& ec = std::get<0>(res);
-                                    if(ec)
-                                        throw asio::system_error{ec};
-                                    return std::get<1>(std::move(res));
-                                }else{
-                                    static_assert(false, "Sender with such completion signature can not transform to awaitable. Try to use \"asio::as_tuple\"");
-                                }
-                            }else{
-                                static_assert(false, "Sender with such completion signature can not transform to awaitable. Try to use \"asio::as_tuple\"");
-                            }
-                        });
-            }
+            // STDEXEC::sender auto __to_single()&& noexcept {
+            //     return  std::move(*this) |
+            //             STDEXEC::then([]<class ..._Args>(_Args&&...args){
+            //                 auto res = asio2exec::__detail::__unwrap_tuple(std::make_tuple(std::forward<_Args>(args)...));
+            //                 using __res_t = decltype(res);
+            //                 using __first_t = std::decay_t<std::tuple_element_t<0, __res_t>>;
+            //                 constexpr size_t n = std::tuple_size<__res_t>{};
+            //                 if constexpr(n == 1){
+            //                     if constexpr(std::is_same_v<__first_t, asio::error_code>){
+            //                         const auto& ec = std::get<0>(res);
+            //                         if(ec)
+            //                             throw asio::system_error{ec};
+            //                         return;
+            //                     }else {
+            //                         return std::get<0>(std::move(res));
+            //                     }
+            //                 }else if constexpr(n == 2){
+            //                     if constexpr(std::is_same_v<__first_t, asio::error_code>){
+            //                         const auto& ec = std::get<0>(res);
+            //                         if(ec)
+            //                             throw asio::system_error{ec};
+            //                         return std::get<1>(std::move(res));
+            //                     }else{
+            //                         static_assert(false, "Sender with such completion signature can not transform to awaitable. Try to use \"asio::as_tuple\"");
+            //                     }
+            //                 }else{
+            //                     static_assert(false, "Sender with such completion signature can not transform to awaitable. Try to use \"asio::as_tuple\"");
+            //                 }
+            //             });
+            // }
 
             // template<class Promise>
             //     requires std::is_base_of_v<STDEXEC::with_awaitable_senders, Promise>

@@ -1,3 +1,6 @@
 .vscode/
 build/
 stdexec
+boost_1_83_0
+test.cpp
+test
