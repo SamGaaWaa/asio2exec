@@ -33,7 +33,7 @@ int main() {
 ```
 **Configure:**
 
-To use Boost.Asio, define **ASIO_USE_BOOST**
+To use Boost.Asio, define **ASIO_TO_EXEC_USE_BOOST**
 
 
 **Note:**

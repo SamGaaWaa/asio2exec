@@ -22,7 +22,7 @@
 
 #pragma once
 
-#if !defined(ASIO_USE_BOOST)
+#if !defined(ASIO_TO_EXEC_USE_BOOST)
 #include "asio/async_result.hpp"
 #include "asio/error_code.hpp"
 #include "asio/io_context.hpp"
@@ -52,7 +52,7 @@
 #include <utility>
 
 #define STDEXEC stdexec
-#if !defined(ASIO_USE_BOOST)
+#if !defined(ASIO_TO_EXEC_USE_BOOST)
 #define ASIO asio
 #else
 #define ASIO boost::asio
@@ -67,9 +67,9 @@ class asio_context {
 public:
     using scheduler_t = __detail::scheduler_t;
     
-    explicit asio_context(int hint = -1) :
-        _ctx{ hint },
-        _guard{ ASIO::make_work_guard(_ctx) } {}
+    asio_context() :
+        _guard{ ASIO::make_work_guard(_ctx) } 
+    {}
 
     asio_context(const asio_context&) = delete;
     asio_context(asio_context&&) = delete;
@@ -356,7 +356,7 @@ template <class _Fn>
 __conv(_Fn) -> __conv<_Fn>;
 
 template<class T>
-constexpr std::string_view type_name(){
+constexpr std::string_view __type_name(){
     return {__PRETTY_FUNCTION__};
 }
 
