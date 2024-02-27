@@ -160,7 +160,7 @@ private:
         return &_storage;
     }
 
-    void do_deallocate(void* ptr, size_t bytes, size_t alignment) override {
+    void do_deallocate(void* ptr, size_t bytes, size_t alignment)noexcept override {
         if(ptr == &_storage){
             _used = false;
             return;
@@ -397,6 +397,9 @@ namespace ASIO {
                 __operation_base& operator=(__operation_base&&) = delete;
 
                 template<class Tag>
+                    requires (std::is_same_v<Tag, STDEXEC::set_value_t> ||
+                              std::is_same_v<Tag, STDEXEC::set_error_t> ||
+                              std::is_same_v<Tag, STDEXEC::set_stopped_t>)
                 struct __completion_task_t {
                     __operation_base *self;
                     using allocator_type = std::pmr::polymorphic_allocator<>;
@@ -409,10 +412,8 @@ namespace ASIO {
                             std::apply(STDEXEC::set_value, std::tuple_cat(std::make_tuple(std::move(self->_r)), std::move(*self->_res)));
                         }else if constexpr(std::is_same_v<Tag, STDEXEC::set_error_t>){
                             STDEXEC::set_error(std::move(self->_r), std::move(self->_err));
-                        }else if constexpr(std::is_same_v<Tag, STDEXEC::set_stopped_t>){
+                        }else {
                             STDEXEC::set_stopped(std::move(self->_r));
-                        }else{
-                            static_assert(false, "Tag should one of set_value_t, set_error_t or set_stopped_t.");
                         }
                     }
                 };
