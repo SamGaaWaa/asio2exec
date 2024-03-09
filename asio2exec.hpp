@@ -31,6 +31,7 @@
 #include "asio/post.hpp"
 #include "asio/bind_executor.hpp"
 #include "asio/bind_allocator.hpp"
+#include "asio/any_io_executor.hpp"
 #else
 #include "boost/asio/async_result.hpp"
 #include "boost/asio/io_context.hpp"
@@ -39,17 +40,20 @@
 #include "boost/asio/post.hpp"
 #include "boost/asio/bind_executor.hpp"
 #include "boost/asio/bind_allocator.hpp"
+#include "boost/asio/any_io_executor.hpp"
 #endif
 
 #include "stdexec/execution.hpp"
 
 #include <atomic>
 #include <cassert>
+#include <functional>
 #include <memory_resource>
 #include <optional>
 #include <thread>
 #include <type_traits>
 #include <utility>
+#include <variant>
 
 #define STDEXEC stdexec
 #if !defined(ASIO_TO_EXEC_USE_BOOST)
@@ -274,27 +278,77 @@ struct scheduler_t {
         return __schedule_sender_t{ self._ctx };
     }
 };
+
+template<class ...Args>
+struct __op_base{
+    virtual void complete(Args ...args)noexcept{};
+    virtual ~__op_base(){}
+};  
     
-template<class T>
+template<class ...Args>
 struct use_sender_handler_base {
     using allocator_type = std::pmr::polymorphic_allocator<>;
 
-    T* op;
+    __op_base<Args...>* op;
     allocator_type allocator;
 
     allocator_type get_allocator() const noexcept { return allocator; }
 
     template<class ..._Args>
     void operator()(_Args&& ...args) {
-        op->template complete(std::forward<_Args>(args)...);
+        op->complete(std::forward<_Args>(args)...);
     }
 };
 
-template<class T>
-struct use_sender_handler: use_sender_handler_base<T> {
+template<class ...Args>
+struct use_sender_handler: use_sender_handler_base<Args...> {
     using cancellation_slot_type = ASIO::cancellation_slot;
     cancellation_slot_type slot;
     cancellation_slot_type get_cancellation_slot() const noexcept { return slot; }
+};
+
+template<class ...Args>
+struct __initializer{
+    using handler_t = std::variant<use_sender_handler_base<Args...>, use_sender_handler<Args...>>;
+    using executor_type = ASIO::any_io_executor;
+
+    template<class Init, class ...InitArgs>
+        requires std::is_convertible_v<std::decay_t<decltype(ASIO::get_associated_executor(std::declval<Init>()))>, executor_type>
+    __initializer(Init&& init, InitArgs&& ...args){
+        _ex = ASIO::get_associated_executor(init);
+        _init = [init = std::forward<Init>(init), ...args = std::forward<InitArgs>(args)]
+                (handler_t handler)mutable{
+                    std::visit([&](auto& h){
+                        std::move(init)(std::move(h), std::move(args)...);
+                    }, handler);
+                };
+    }
+
+    template<class Init>
+        requires std::is_convertible_v<std::decay_t<decltype(ASIO::get_associated_executor(std::declval<Init>()))>, executor_type>
+    __initializer(Init&& init){
+        _ex = ASIO::get_associated_executor(init);
+        _init = [init = std::forward<Init>(init)]
+                (handler_t handler)mutable{
+                    std::visit([&](auto& h){
+                        std::move(init)(std::move(h));
+                    }, handler);
+                };
+    }
+
+    __initializer(const __initializer&) = delete;
+    __initializer& operator=(const __initializer&) = delete;
+    __initializer(__initializer&&) = default;
+
+    void operator()(handler_t handler){
+        std::move(_init)(std::move(handler));
+    }
+
+    const executor_type& get_executor()const noexcept{ return _ex; }
+    executor_type& get_executor()noexcept{ return _ex; }
+private:
+    std::move_only_function<void(handler_t)> _init;
+    executor_type _ex;
 };
 
 template<class ...Args>
@@ -360,6 +414,304 @@ constexpr std::string_view __type_name(){
     return {__PRETTY_FUNCTION__};
 }
 
+template<class ...Args>
+struct __sender{
+    using is_sender = __sender;
+
+    __initializer<Args...> _init;
+
+    template<STDEXEC::receiver R>
+    struct __operation_base: asio2exec::__detail::__op_base<Args...> {
+        using __res_t = std::optional<std::tuple<Args...>>;
+
+        __initializer<Args...> _init;
+        R _r;
+        asio2exec::asio_context *_ctx{nullptr};
+        __res_t _res{};
+        std::exception_ptr _err{};
+
+        __operation_base(__initializer<Args...>&& i, R&& r, asio2exec::asio_context *ctx = nullptr)
+            : _init{std::move(i)}, _r{std::move(r)}, _ctx{ctx}
+        {}
+
+        __operation_base(const __operation_base&) = delete;
+        __operation_base(__operation_base&&) = delete;
+        __operation_base& operator=(const __operation_base&) = delete;
+        __operation_base& operator=(__operation_base&&) = delete;
+
+        template<class Tag>
+            requires (std::is_same_v<Tag, STDEXEC::set_value_t> ||
+                        std::is_same_v<Tag, STDEXEC::set_error_t> ||
+                        std::is_same_v<Tag, STDEXEC::set_stopped_t>)
+        struct __completion_task_t {
+            __operation_base *self;
+            using allocator_type = std::pmr::polymorphic_allocator<>;
+            allocator_type allocator;
+
+            allocator_type get_allocator() const noexcept { return allocator; }
+
+            void operator()()noexcept{
+                if constexpr(std::is_same_v<Tag, STDEXEC::set_value_t>){
+                    std::apply(STDEXEC::set_value, std::tuple_cat(std::make_tuple(std::move(self->_r)), std::move(*self->_res)));
+                }else if constexpr(std::is_same_v<Tag, STDEXEC::set_error_t>){
+                    STDEXEC::set_error(std::move(self->_r), std::move(self->_err));
+                }else {
+                    STDEXEC::set_stopped(std::move(self->_r));
+                }
+            }
+        };
+
+        asio2exec::__detail::__sbo_buffer<128> _buf{};
+
+        void __value()noexcept{
+            if(_ctx){
+                ASIO::post(_ctx->get_executor().get_executor(), __completion_task_t<STDEXEC::set_value_t>{
+                    .self{this},
+                    .allocator{&_buf}
+                });
+                return;
+            }
+            std::apply(STDEXEC::set_value, std::tuple_cat(std::make_tuple(std::move(_r)), std::move(*_res)));
+        }
+
+        void __stop()noexcept{
+            if(_ctx){
+                ASIO::post(_ctx->get_executor().get_executor(), __completion_task_t<STDEXEC::set_stopped_t>{
+                    .self{this},
+                    .allocator{&_buf}
+                });
+                return;
+            }
+            STDEXEC::set_stopped(std::move(_r));
+        }
+
+        void __error()noexcept{
+            if(_ctx){
+                ASIO::post(_ctx->get_executor().get_executor(), __completion_task_t<STDEXEC::set_error_t>{
+                    .self{this},
+                    .allocator{&_buf}
+                });
+                return;
+            }
+            STDEXEC::set_error(std::move(_r), std::move(_err));
+        }
+
+        void __init(){
+            this->_init(use_sender_handler_base<Args...>{
+                .op{this},
+                .allocator{&this->_buf}
+            });
+        }
+
+        void complete(Args ...args)noexcept override{
+            _res.emplace(std::move(args)...);
+            using __first_t = asio2exec::__detail::__unwrap_first_t<decltype(*_res)>;
+            if constexpr(std::is_convertible_v<__first_t, std::error_code>){
+                if(asio2exec::__detail::__unwrap_first(*_res) == std::errc::operation_canceled){
+                    __stop();
+                    return;
+                }
+            }
+            __value();
+        }
+
+    };
+
+    template<STDEXEC::receiver R>
+    struct __operation: __operation_base<R> {
+        __operation(__initializer<Args...>&& i, R&& r, asio2exec::asio_context *ctx = nullptr)
+            : __operation_base<R>(std::move(i), std::move(r), ctx)
+        {}
+
+        enum struct __state_t: char{
+            construction, emplaced, initiated, stopped
+        };
+
+        ASIO::cancellation_signal _signal{};
+        std::atomic<__state_t> _state{__state_t::construction};
+
+        struct __stop_t{
+            __operation *self;
+            void operator()()noexcept{
+                __state_t expected = self->_state.load(std::memory_order_relaxed);
+                while(!self->_state.compare_exchange_weak(expected, __state_t::stopped, std::memory_order_acq_rel))
+                {}
+                if(expected == __state_t::initiated){
+                    self->_signal.emit(ASIO::cancellation_type_t::total);
+                }
+            }
+        };
+
+        using __stop_callback_t = typename STDEXEC::stop_token_of_t<STDEXEC::env_of_t<R>&>:: template callback_type<__stop_t>;
+
+        std::optional<__stop_callback_t> _stop_callback{};
+
+        void __init(){
+            this->_init(use_sender_handler<Args...>{
+                {
+                    .op{this},
+                    .allocator{&this->_buf}
+                },
+                _signal.slot()
+            });
+        }
+
+        void complete(Args ...args)noexcept override{
+            _stop_callback.reset();
+            __operation_base<R>::complete(std::move(args)...);
+        }
+
+        friend void tag_invoke(STDEXEC::start_t, __operation& self)noexcept
+        {
+            const auto st = STDEXEC::get_stop_token(STDEXEC::get_env(self._r));
+            if(st.stop_requested()){
+                self.__stop();
+                return;
+            }
+            self._stop_callback.emplace(st, __stop_t{&self});
+            __state_t expected = __state_t::construction;
+            if(!self._state.compare_exchange_strong(expected, __state_t::emplaced, std::memory_order_acq_rel)){
+                self._stop_callback.reset();
+                self.__stop();
+                return;
+            }
+            //初始化IO
+            try{
+                self.__init();
+            }catch(...){
+                self._stop_callback.reset();
+                self._err = std::current_exception();
+                self.__error();
+                return;
+            }
+            // 如果没有请求取消，self._state == __state_t::emplaced
+            expected = __state_t::emplaced;
+            if(!self._state.compare_exchange_strong(expected, __state_t::initiated, std::memory_order_acq_rel)){
+                // 已经请求取消，但stop_callback不会发出取消信号（见__stop_t的if分支）
+                self._stop_callback.reset();
+                self._signal.emit(ASIO::cancellation_type_t::total);
+                return;
+            }
+        }
+    };
+
+    struct __transfer_sender {
+        using is_sender = __transfer_sender;
+
+        using __completion_signatures = STDEXEC::completion_signatures<
+            STDEXEC::set_value_t(Args&&...),
+            STDEXEC::set_error_t(std::exception_ptr),
+            STDEXEC::set_stopped_t()
+        >;
+
+        template<class Env>
+        friend auto tag_invoke(STDEXEC::get_completion_signatures_t, const __transfer_sender&, Env)noexcept
+            -> __completion_signatures{ 
+            return {}; 
+        }
+
+        __initializer<Args...> _init;
+        
+
+        template<STDEXEC::receiver R>
+        struct __transfer_op_without_cancellation: __operation_base<R> {
+            __transfer_op_without_cancellation(__initializer<Args...>&& i, R&& r, asio2exec::asio_context *ctx = nullptr)
+                : __operation_base<R>(std::move(i), std::move(r), ctx)
+            {}
+
+            friend void tag_invoke(STDEXEC::start_t, __transfer_op_without_cancellation& self)noexcept
+            {
+                try {
+                    self.__init();
+                }
+                catch (...) {
+                    self._err = std::current_exception();
+                    self.__error();
+                }
+            }
+        };
+
+        template<STDEXEC::receiver R>
+        friend STDEXEC::operation_state auto tag_invoke(STDEXEC::connect_t, __transfer_sender&& self, R&& r){
+            if constexpr(STDEXEC::unstoppable_token<STDEXEC::stop_token_of_t<STDEXEC::env_of_t<R>>>){
+                return __transfer_op_without_cancellation<R>(
+                    std::move(self._init),
+                    std::forward<R>(r)
+                );
+            }else{
+                return __operation<R>(
+                    std::move(self._init),
+                    std::forward<R>(r)
+                );
+            }
+        }
+    };
+
+    template<STDEXEC::receiver R>
+    struct __asio_op_without_cancellation: __operation_base<R> {
+        __asio_op_without_cancellation(__initializer<Args...>&& i, R&& r, asio2exec::asio_context *ctx = nullptr)
+            : __operation_base<R>(std::move(i), std::move(r), ctx)
+        {}
+        
+        friend void tag_invoke(STDEXEC::start_t, __asio_op_without_cancellation& self)noexcept{
+            try {
+                self.__init();
+            }
+            catch (...) {
+                self._err = std::current_exception();
+                self.__error();
+            }
+        }
+    };
+
+    template<STDEXEC::receiver R>
+    friend STDEXEC::operation_state auto tag_invoke(STDEXEC::connect_t, __sender&& self, R&& r)
+    {
+        const auto env = STDEXEC::get_env(r);
+        auto sched = STDEXEC::get_scheduler(env);
+
+        if constexpr(std::is_same_v<std::decay_t<decltype(sched)>, asio2exec::asio_context::scheduler_t>){
+            const auto& ex = sched._ctx->get_executor().get_executor();
+            const auto &associated_executor = ASIO::get_associated_executor(self._init);
+            if constexpr(STDEXEC::unstoppable_token<STDEXEC::stop_token_of_t<STDEXEC::env_of_t<R>>>){
+                return __asio_op_without_cancellation<R>(
+                    std::move(self._init),
+                    std::forward<R>(r),
+                    ex == associated_executor ? nullptr : sched._ctx
+                );
+            }else{
+                return __operation<R>(
+                    std::move(self._init),
+                    std::forward<R>(r),
+                    ex == associated_executor ? nullptr : sched._ctx
+                );
+            }
+        }else {
+            return STDEXEC::connect(
+                STDEXEC::transfer(
+                    __transfer_sender{
+                        ._init{std::move(self._init)},
+                    }, 
+                    sched
+                ), 
+                std::forward<R>(r)
+            );
+        }
+    }
+
+    using __completion_signatures = STDEXEC::completion_signatures<
+        STDEXEC::set_value_t(Args&&...),
+        STDEXEC::set_error_t(std::exception_ptr),
+        STDEXEC::set_stopped_t()
+    >;
+
+    template<class Env>
+    friend auto tag_invoke(STDEXEC::get_completion_signatures_t, const __sender&, Env)noexcept
+        -> __completion_signatures{ 
+        return {}; 
+    }
+}; // __sender
+
 }// __detail
 
 __detail::scheduler_t asio_context::get_scheduler()noexcept { return __detail::scheduler_t{ this }; }
@@ -370,441 +722,19 @@ namespace ASIO {
 
     template<class ...Args>
     struct async_result<asio2exec::use_sender_t, void(Args...)> {
-        template<class Initiation, class ...InitArgs>
-        struct __sender {
-            using is_sender = __sender;
-
-            Initiation initiation;
-            std::tuple<InitArgs...> args;
-
-            template<class Init, STDEXEC::receiver R>
-            struct __operation_base {
-                using __res_t = std::optional<std::tuple<Args...>>;
-                Init init;
-                std::tuple<InitArgs...> args;
-                R _r;
-                asio2exec::asio_context *_ctx{nullptr};
-                __res_t _res{};
-                std::exception_ptr _err{};
-
-                __operation_base(Init&& i, std::tuple<InitArgs...>&& a, R&& r, asio2exec::asio_context *ctx = nullptr)
-                    : init{std::move(i)}, args{std::move(a)}, _r{std::move(r)}, _ctx{ctx}
-                {}
-
-                __operation_base(const __operation_base&) = delete;
-                __operation_base(__operation_base&&) = delete;
-                __operation_base& operator=(const __operation_base&) = delete;
-                __operation_base& operator=(__operation_base&&) = delete;
-
-                template<class Tag>
-                    requires (std::is_same_v<Tag, STDEXEC::set_value_t> ||
-                              std::is_same_v<Tag, STDEXEC::set_error_t> ||
-                              std::is_same_v<Tag, STDEXEC::set_stopped_t>)
-                struct __completion_task_t {
-                    __operation_base *self;
-                    using allocator_type = std::pmr::polymorphic_allocator<>;
-                    allocator_type allocator;
-
-                    allocator_type get_allocator() const noexcept { return allocator; }
-
-                    void operator()()noexcept{
-                        if constexpr(std::is_same_v<Tag, STDEXEC::set_value_t>){
-                            std::apply(STDEXEC::set_value, std::tuple_cat(std::make_tuple(std::move(self->_r)), std::move(*self->_res)));
-                        }else if constexpr(std::is_same_v<Tag, STDEXEC::set_error_t>){
-                            STDEXEC::set_error(std::move(self->_r), std::move(self->_err));
-                        }else {
-                            STDEXEC::set_stopped(std::move(self->_r));
-                        }
-                    }
-                };
-
-                asio2exec::__detail::__sbo_buffer<128> _buf{};
-
-                void __value()noexcept{
-                    if(_ctx){
-                        ASIO::post(_ctx->get_executor().get_executor(), __completion_task_t<STDEXEC::set_value_t>{
-                            .self{this},
-                            .allocator{&_buf}
-                        });
-                        return;
-                    }
-                    std::apply(STDEXEC::set_value, std::tuple_cat(std::make_tuple(std::move(_r)), std::move(*_res)));
-                }
-
-                void __stop()noexcept{
-                    if(_ctx){
-                        ASIO::post(_ctx->get_executor().get_executor(), __completion_task_t<STDEXEC::set_stopped_t>{
-                            .self{this},
-                            .allocator{&_buf}
-                        });
-                        return;
-                    }
-                    STDEXEC::set_stopped(std::move(_r));
-                }
-
-                void __error()noexcept{
-                    if(_ctx){
-                        ASIO::post(_ctx->get_executor().get_executor(), __completion_task_t<STDEXEC::set_error_t>{
-                            .self{this},
-                            .allocator{&_buf}
-                        });
-                        return;
-                    }
-                    STDEXEC::set_error(std::move(_r), std::move(_err));
-                }
-
-                void __init()noexcept{
-                    std::apply(
-                        [this](InitArgs&& ...init_args) {
-                            std::move(this->init)(
-                                asio2exec::__detail::use_sender_handler_base<__operation_base>{
-                                    .op{this},
-                                    .allocator{&this->_buf}
-                                },
-                                std::move(init_args)...
-                            );
-                        },
-                        std::move(this->args)
-                    );
-                }
-
-                template<class ..._Args>
-                void complete(_Args&& ...args)noexcept {
-                    _res.emplace(std::forward<_Args>(args)...);
-                    using __first_t = asio2exec::__detail::__unwrap_first_t<decltype(*_res)>;
-                    if constexpr(std::is_convertible_v<__first_t, std::error_code>){
-                        if(asio2exec::__detail::__unwrap_first(*_res) == std::errc::operation_canceled){
-                            __stop();
-                            return;
-                        }
-                    }
-                    __value();
-                }
-
-            };
-
-            template<class Init, STDEXEC::receiver R>
-            struct __operation: __operation_base<Init, R> {
-                __operation(Init&& i, std::tuple<InitArgs...>&& a, R&& r, asio2exec::asio_context *ctx = nullptr)
-                    : __operation_base<Init, R>(std::move(i), std::move(a), std::move(r), ctx)
-                {}
-
-                enum struct __state_t: char{
-                    construction, emplaced, initiated, stopped
-                };
-
-                ASIO::cancellation_signal _signal{};
-                std::atomic<__state_t> _state{__state_t::construction};
-
-                struct __stop_t{
-                    __operation *self;
-                    void operator()()noexcept{
-                        __state_t expected = self->_state.load(std::memory_order_relaxed);
-                        while(!self->_state.compare_exchange_weak(expected, __state_t::stopped, std::memory_order_acq_rel))
-                        {}
-                        if(expected == __state_t::initiated){
-                            self->_signal.emit(ASIO::cancellation_type_t::total);
-                        }
-                    }
-                };
-
-                using __stop_callback_t = typename STDEXEC::stop_token_of_t<STDEXEC::env_of_t<R>&>:: template callback_type<__stop_t>;
-
-                std::optional<__stop_callback_t> _stop_callback{};
-
-                void __init()noexcept{
-                    std::apply(
-                        [this](InitArgs&& ...init_args) {
-                            std::move(this->init)(
-                                asio2exec::__detail::use_sender_handler<__operation>{
-                                    {
-                                        .op{this},
-                                        .allocator{&this->_buf}
-                                    },
-                                    _signal.slot()
-                                },
-                                std::move(init_args)...
-                            );
-                        },
-                        std::move(this->args)
-                    );
-                }
-
-                template<class ..._Args>
-                void complete(_Args&& ...args)noexcept {
-                    _stop_callback.reset();
-                    __operation_base<Init, R>::complete(std::forward<_Args>(args)...);
-                }
-
-                friend void tag_invoke(STDEXEC::start_t, __operation& self)noexcept
-                {
-                    const auto st = STDEXEC::get_stop_token(STDEXEC::get_env(self._r));
-                    if(st.stop_requested()){
-                        self.__stop();
-                        return;
-                    }
-                    self._stop_callback.emplace(st, __stop_t{&self});
-                    __state_t expected = __state_t::construction;
-                    if(!self._state.compare_exchange_strong(expected, __state_t::emplaced, std::memory_order_acq_rel)){
-                        self._stop_callback.reset();
-                        self.__stop();
-                        return;
-                    }
-                    //初始化IO
-                    try{
-                        self.__init();
-                    }catch(...){
-                        self._stop_callback.reset();
-                        self._err = std::current_exception();
-                        self.__error();
-                        return;
-                    }
-                    // 如果没有请求取消，self._state == __state_t::emplaced
-                    expected = __state_t::emplaced;
-                    if(!self._state.compare_exchange_strong(expected, __state_t::initiated, std::memory_order_acq_rel)){
-                        // 已经请求取消，但stop_callback不会发出取消信号（见__stop_t的if分支）
-                        self._stop_callback.reset();
-                        self._signal.emit(ASIO::cancellation_type_t::total);
-                        return;
-                    }
-                }
-            };
-
-            struct __transfer_sender {
-                using is_sender = __transfer_sender;
-
-                using __completion_signatures = STDEXEC::completion_signatures<
-                    STDEXEC::set_value_t(Args...),
-                    STDEXEC::set_error_t(std::exception_ptr),
-                    STDEXEC::set_stopped_t()
-                >;
-
-                template<class Env>
-                friend auto tag_invoke(STDEXEC::get_completion_signatures_t, const __transfer_sender&, Env)noexcept
-                    -> __completion_signatures{ 
-                    return {}; 
-                }
-
-                Initiation init;
-                std::tuple<InitArgs...> args;
-
-                template<class Init, STDEXEC::receiver R>
-                struct __transfer_op_without_cancellation: __operation_base<Init, R> {
-                    __transfer_op_without_cancellation(Init&& i, std::tuple<InitArgs...>&& a, R&& r, asio2exec::asio_context *ctx = nullptr)
-                        : __operation_base<Init, R>(std::move(i), std::move(a), std::move(r), ctx)
-                    {}
-
-                    friend void tag_invoke(STDEXEC::start_t, __transfer_op_without_cancellation& self)noexcept
-                    {
-                        try {
-                            self.__init();
-                        }
-                        catch (...) {
-                            self._err = std::current_exception();
-                            self.__error();
-                        }
-                    }
-                };
-
-                template<STDEXEC::receiver R>
-                friend STDEXEC::operation_state auto tag_invoke(STDEXEC::connect_t, __transfer_sender&& self, R&& r){
-                    if constexpr(STDEXEC::unstoppable_token<STDEXEC::stop_token_of_t<STDEXEC::env_of_t<R>>>){
-                        return __transfer_op_without_cancellation<std::decay_t<Initiation>, R>(
-                            std::move(self.init),
-                            std::move(self.args),
-                            std::forward<R>(r)
-                        );
-                    }else{
-                        return __operation<std::decay_t<Initiation>, R>(
-                            std::move(self.init),
-                            std::move(self.args),
-                            std::forward<R>(r)
-                        );
-                    }
-                }
-            };
-
-            template<class Init, STDEXEC::receiver R>
-            struct __asio_op_without_cancellation: __operation_base<Init, R> {
-                __asio_op_without_cancellation(Init&& i, std::tuple<InitArgs...>&& a, R&& r, asio2exec::asio_context *ctx = nullptr)
-                    : __operation_base<Init, R>(std::move(i), std::move(a), std::move(r), ctx)
-                {}
-                
-                friend void tag_invoke(STDEXEC::start_t, __asio_op_without_cancellation& self)noexcept{
-                    try {
-                        self.__init();
-                    }
-                    catch (...) {
-                        self._err = std::current_exception();
-                        self.__error();
-                    }
-                }
-            };
-
-            template<STDEXEC::receiver R>
-            friend STDEXEC::operation_state auto tag_invoke(STDEXEC::connect_t, __sender&& self, R&& r)
-            {
-                const auto env = STDEXEC::get_env(r);
-                auto sched = STDEXEC::get_scheduler(env);
-
-                if constexpr(std::is_same_v<std::decay_t<decltype(sched)>, asio2exec::asio_context::scheduler_t>){
-                    const auto& ex = sched._ctx->get_executor().get_executor();
-                    const auto& associated_executor = get_associated_executor(self.initiation);
-                    if constexpr(STDEXEC::unstoppable_token<STDEXEC::stop_token_of_t<STDEXEC::env_of_t<R>>>){
-                        return __asio_op_without_cancellation<std::decay_t<Initiation>, R>(
-                            std::move(self.initiation),
-                            std::move(self.args),
-                            std::forward<R>(r),
-                            ex == associated_executor ? nullptr : sched._ctx
-                        );
-                    }else{
-                        return __operation<std::decay_t<Initiation>, R>(
-                            std::move(self.initiation),
-                            std::move(self.args),
-                            std::forward<R>(r),
-                            ex == associated_executor ? nullptr : sched._ctx
-                        );
-                    }
-                }else {
-                    return STDEXEC::connect(
-                        STDEXEC::transfer(
-                            __transfer_sender{
-                                .init{std::move(self.initiation)},
-                                .args{std::move(self.args)}
-                            }, 
-                            sched
-                        ), 
-                        std::forward<R>(r)
-                    );
-                }
-            }
-
-            // STDEXEC::sender auto __to_single()&& noexcept {
-            //     return  std::move(*this) |
-            //             STDEXEC::then([]<class ..._Args>(_Args&&...args){
-            //                 auto res = asio2exec::__detail::__unwrap_tuple(std::make_tuple(std::forward<_Args>(args)...));
-            //                 using __res_t = decltype(res);
-            //                 using __first_t = std::decay_t<std::tuple_element_t<0, __res_t>>;
-            //                 constexpr size_t n = std::tuple_size<__res_t>{};
-            //                 if constexpr(n == 1){
-            //                     if constexpr(std::is_same_v<__first_t, asio::error_code>){
-            //                         const auto& ec = std::get<0>(res);
-            //                         if(ec)
-            //                             throw asio::system_error{ec};
-            //                         return;
-            //                     }else {
-            //                         return std::get<0>(std::move(res));
-            //                     }
-            //                 }else if constexpr(n == 2){
-            //                     if constexpr(std::is_same_v<__first_t, asio::error_code>){
-            //                         const auto& ec = std::get<0>(res);
-            //                         if(ec)
-            //                             throw asio::system_error{ec};
-            //                         return std::get<1>(std::move(res));
-            //                     }else{
-            //                         static_assert(false, "Sender with such completion signature can not transform to awaitable. Try to use \"asio::as_tuple\"");
-            //                     }
-            //                 }else{
-            //                     static_assert(false, "Sender with such completion signature can not transform to awaitable. Try to use \"asio::as_tuple\"");
-            //                 }
-            //             });
-            // }
-
-            // template<class Promise>
-            //     requires std::is_base_of_v<STDEXEC::with_awaitable_senders, Promise>
-            // struct __awaitable_receiver_t{
-            //     using receiver_concept = STDEXEC::receiver_t;
-            //     Awaitable *_await;
-            //     Promise *_promise;
-
-            //     template<class _T>
-            //         requires std::is_nothrow_convertible_v<_T, T>
-            //     friend void tag_invoke(STDEXEC::set_value_t, __awaitable_receiver_t&& R, _T&& t)noexcept{
-            //         R._await->template _res.emplace(std::forward<_T>(t));
-            //         R._await->template _h.resume();
-            //     }
-
-            //     friend void tag_invoke(STDEXEC::set_error_t, __awaitable_receiver_t&& R, std::exception_ptr err)noexcept{
-            //         R._await->template _err = std::move(err);
-            //         R._await->template _h.resume();
-            //     }
-
-            //     friend void tag_invoke(STDEXEC::set_stopped_t, __awaitable_receiver_t&& R)noexcept{
-            //         R._promise->template unhandled_stopped();
-            //     }
-            // };
-
-            // template<STDEXEC::sender Snd, STDEXEC::operation_state St, class T>
-            // struct __awaitable_t {
-            //     Snd _s;
-            //     std::coroutine_handle<> _h{};
-            //     std::optional<St> _state{};
-            //     std::optional<T> _res{};
-            //     std::exception_ptr _err{};
-
-            //     bool await_ready()const noexcept{ return false; }
-
-            //     template<class CoroHandle>
-            //     bool await_suspend(CoroHandle h){
-            //         using __promise_t = decltype(h.promise());
-            //         _h = h;
-            //         __receiver_t<__awaitable_t, __promise_t> r{this, &h.promise()};
-            //         _state.emplace(asio2exec::__detail::__conv{[r, s = std::move(_s)]()mutable{
-            //             return STDEXEC::connect(std::move(s), std::move(r));
-            //         }});
-            //         STDEXEC::start(*_state);
-            //         return true;
-            //     }
-
-            //     T await_resume()noexcept{
-            //         if(_err)
-            //             std::rethrow_exception(_err);
-            //         return std::move(*_res);
-            //     }
-
-            // };
-
-            // struct __debug_awaitable{
-            //     bool await_ready(){ return false; }
-                
-            //     template<class CoroHandle>
-            //     bool await_suspend(CoroHandle h){
-            //         std::cout << typeid(h.template promise()).name() << '\n';
-            //         return false;
-            //     }
-
-            //     int await_resume(){
-            //         return 2;
-            //     }
-            // };
-
-            // template<class Promise>
-            // friend auto tag_invoke(STDEXEC::as_awaitable_t, __sender&&, Promise&)noexcept{
-            //     return __debug_awaitable{};
-            // }
-
-            using __completion_signatures = STDEXEC::completion_signatures<
-                STDEXEC::set_value_t(Args...),
-                STDEXEC::set_error_t(std::exception_ptr),
-                STDEXEC::set_stopped_t()
-            >;
-
-            template<class Env>
-            friend auto tag_invoke(STDEXEC::get_completion_signatures_t, const __sender&, Env)noexcept
-                -> __completion_signatures{ 
-                return {}; 
-            }
-        };
+        using return_type = asio2exec::__detail::__sender<Args...>;
 
         template<class Initiation, class ...InitArgs>
-        static STDEXEC::sender auto initiate(
+        static return_type initiate(
             Initiation&& init,
             asio2exec::use_sender_t,
             InitArgs&& ...args
         ){
-            return __sender<std::decay_t<Initiation>, std::decay_t<InitArgs>...>{
-                .initiation{std::move(init)},
-                .args{std::move(args)...} 
+            return return_type{
+                ._init{asio2exec::__detail::__initializer<Args...>(
+                    std::forward<Initiation>(init),
+                    std::forward<InitArgs>(args)...
+                )},
             };
         }
 
