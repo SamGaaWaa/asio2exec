@@ -7,7 +7,7 @@ endif()
 
 project ("asio2exec")
 
-set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_FLAGS "-fconcepts-diagnostics-depth=4 -pthread -Wnon-template-friend ${CMAKE_CXX_FLAGS}")
 
 if(NOT EXISTS "${CMAKE_SOURCE_DIR}/stdexec")
