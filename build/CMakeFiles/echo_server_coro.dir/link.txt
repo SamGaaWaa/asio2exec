@@ -1,0 +1,1 @@
+/usr/bin/c++ -fconcepts-diagnostics-depth=4 -pthread -Wnon-template-friend  CMakeFiles/echo_server_coro.dir/examples/echo_server_coro.cpp.o -o echo_server_coro 
