@@ -1,1 +1,0 @@
-/usr/bin/c++ -fconcepts-diagnostics-depth=4 -pthread -Wnon-template-friend  CMakeFiles/echo_server.dir/examples/echo_server.cpp.o -o echo_server 
