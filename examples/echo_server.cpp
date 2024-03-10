@@ -55,20 +55,16 @@ int main(int argc, char **argv){
                                                     std::string_view msg{buf.data(), n};
                                                     std::cout << msg << '\n';
                                                     timer.expires_after(std::chrono::seconds(30));
-                                                    // return  exec::when_any(
-                                                    //             asio::async_write(s, asio::buffer(buf.data(), n), use_sender),
-                                                    //             timer.async_wait(use_sender) | ex::let_value([](auto){ return ex::just_stopped(); })
-                                                    //         ) |
-                                                    //         ex::then([&](asio::error_code ec, size_t n){
-                                                    //             if(n == 0)
-                                                    //                 return true;
-                                                    //             if(ec)
-                                                    //                 throw asio::system_error{ec};
-                                                    //             return !s.is_open();
-                                                    //         });
-                                                    return timer.async_wait(use_sender) | 
-                                                            ex::then([](auto){
-                                                                return true;
+                                                    return  exec::when_any(
+                                                                asio::async_write(s, asio::buffer(buf.data(), n), use_sender),
+                                                                timer.async_wait(use_sender) | ex::let_value([](auto){ return ex::just_stopped(); })
+                                                            ) |
+                                                            ex::then([&](asio::error_code ec, size_t n){
+                                                                if(n == 0)
+                                                                    return true;
+                                                                if(ec)
+                                                                    throw asio::system_error{ec};
+                                                                return !s.is_open();
                                                             });
                                                 }) |
                                                 ex::upon_error([](auto){

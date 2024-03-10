@@ -1,1 +1,0 @@
-/usr/bin/c++ -fconcepts-diagnostics-depth=4 -pthread -Wnon-template-friend  CMakeFiles/as_default.dir/examples/as_default.cpp.o -o as_default 
