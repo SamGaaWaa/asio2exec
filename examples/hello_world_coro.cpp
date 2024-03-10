@@ -9,7 +9,9 @@ using namespace asio2exec;
 
 exec::task<std::string> hello(asio_context& ctx){
     asio::steady_timer timer{ctx.get_executor(), std::chrono::seconds(3)};
-    co_await timer.async_wait(use_sender);
+    asio::error_code ec = co_await timer.async_wait(use_sender);
+    if(ec)
+        throw asio::system_error(ec);
     co_return "Hello World";
 }
 
