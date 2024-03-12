@@ -47,7 +47,9 @@
 
 #include <atomic>
 #include <cassert>
+#include <cstring>
 #include <functional>
+#include <memory>
 #include <memory_resource>
 #include <optional>
 #include <thread>
@@ -82,10 +84,12 @@ public:
 
     ~asio_context() {
         stop();
+        if(_th.joinable())
+            _th.join();
     }
 
     void start() {
-        _th = std::jthread([this] {
+        _th = std::thread([this] {
             _ctx.run();
         });
     }
@@ -102,7 +106,7 @@ public:
 private:
     ASIO::io_context _ctx;
     ASIO::executor_work_guard<ASIO::io_context::executor_type> _guard;
-    std::jthread _th;
+    std::thread _th;
 };
 
 struct use_sender_t 
@@ -188,20 +192,14 @@ struct scheduler_t {
     bool operator==(const scheduler_t&)const noexcept = default;
 
     struct __schedule_sender_t {
-        using is_sender = __schedule_sender_t;
+        using sender_concept = STDEXEC::sender_t;
         asio_context* _ctx;
 
-        using __completion_signatures = STDEXEC::completion_signatures<
+        using completion_signatures = STDEXEC::completion_signatures<
             STDEXEC::set_value_t(),
             STDEXEC::set_error_t(std::exception_ptr),
             STDEXEC::set_stopped_t()
         >;
-
-        template<class Env>
-        friend auto tag_invoke(STDEXEC::get_completion_signatures_t, const __schedule_sender_t&, const Env&)noexcept
-            -> __completion_signatures{ 
-            return {}; 
-        }
 
         struct __env_t {
             asio_context* _ctx;
@@ -307,47 +305,424 @@ struct use_sender_handler: use_sender_handler_base<Args...> {
     cancellation_slot_type get_cancellation_slot() const noexcept { return slot; }
 };
 
+struct __any_t{
+private:
+    struct __any_base {
+        using __move_to_fn = __any_base* (*)(__any_base*, void *buf, size_t size)noexcept;
+        using __get_fn = void* (*)(__any_base*)noexcept;
+        using __destroy_fn = void (*)(__any_base*)noexcept;
+        using __free_fn = void (*)(__any_base*)noexcept;
+
+        __move_to_fn move_to{nullptr};
+        __get_fn get{nullptr};
+        __destroy_fn destroy{nullptr};
+        __free_fn free{nullptr};
+        size_t size{0};
+        size_t alignment{0};
+
+        __any_base() = default;
+
+        __any_base(const __any_base&) = delete;
+        __any_base& operator=(const __any_base&) = delete;
+
+        __any_base(__any_base&& other)noexcept{}
+        __any_base& operator=(__any_base&& other)noexcept = default;
+    };
+
+    template<class T>
+        requires std::is_nothrow_move_constructible_v<T>
+    struct __any_impl: __any_base{
+        union{
+            T _val;
+        };
+
+        __any_impl()noexcept{
+            move_to = __move_to;
+            get = __get;
+            destroy = __destroy;
+            free = __free;
+            size = sizeof(__any_impl);
+            alignment = alignof(__any_impl);
+        }
+
+        template<class ..._Args>
+        __any_impl(_Args&&... args)noexcept(std::is_nothrow_constructible_v<T, _Args...>):
+            _val(std::forward<_Args>(args)...)
+        {
+            move_to = __move_to;
+            get = __get;
+            destroy = __destroy;
+            free = __free;
+            size = sizeof(__any_impl);
+            alignment = alignof(__any_impl);
+        }
+
+        __any_impl(__any_impl&& other) = delete;
+        __any_impl& operator=(__any_impl&& other) = delete;
+
+        static __any_base *__move_to(__any_base* base, void *buf, size_t size)noexcept{
+            auto self = (__any_impl*)base;
+            auto impl = (__any_impl*)std::align(alignof(__any_impl), sizeof(__any_impl), buf, size);
+            assert(impl);
+            if constexpr(!std::is_trivially_move_constructible_v<T>){
+                new (impl) __any_impl(std::move(self->_val));
+            }else{
+                new (impl) __any_impl;
+                std::memcpy(std::addressof(impl->_val), std::addressof(self->_val), sizeof(T));
+            }
+            if constexpr(!std::is_trivially_destructible_v<T>){
+                self->_val.~T();
+            }
+            return impl;
+        }
+
+        static void *__get(__any_base* base)noexcept{
+            return std::addressof(((__any_impl*)base)->_val);
+        }
+
+        static void __destroy(__any_base* base)noexcept{
+            if constexpr(!std::is_trivially_destructible_v<T>){
+                auto self = (__any_impl*)base;
+                self->_val.~T();
+            }
+        }
+
+        static void __free(__any_base* base)noexcept{
+            std::allocator<__any_impl> allocator;
+            allocator.deallocate((__any_impl*)base, 1);
+        }
+    };
+
+    template<class F>
+        requires (std::is_nothrow_invocable_v<F> && 
+                    std::is_nothrow_move_constructible_v<F>)
+    struct __guard{
+        F _f;
+        bool _valid{true};
+
+        explicit __guard(F&& f)noexcept:
+            _f{std::move(f)}
+        {}
+
+        __guard(const __guard&) = delete;
+        __guard& operator=(const __guard&) = delete;
+        __guard(__guard&& other) = delete;
+        __guard& operator=(__guard&& other) = delete;
+
+        ~__guard()noexcept{
+            if(_valid){
+                _f();
+            }
+        }
+
+        void reset()noexcept{
+            _valid = false;
+        }
+    };
+    
+public:
+    __any_t()noexcept = default;
+
+    __any_t(const __any_t&) = delete;
+    __any_t& operator=(const __any_t&) = delete;
+
+    __any_t(__any_t&& other)noexcept{
+        if(!other._ptr){
+            return;
+        }
+        if(other.__is_allocated()){
+            _ptr = std::exchange(other._ptr, nullptr);
+            return;
+        }
+        _ptr = std::exchange(other._ptr, nullptr);
+        _ptr = _ptr->move_to(_ptr, _storage, sizeof(_storage));
+    }
+
+    __any_t& operator=(__any_t&& other)noexcept{
+        if(this == &other)
+            return *this;
+        if(!other._ptr){
+            reset();
+            return *this;
+        }
+        if(!_ptr){
+            if(other.__is_allocated()){
+                _ptr = std::exchange(other._ptr, nullptr);
+                return *this;
+            }
+            _ptr = std::exchange(other._ptr, nullptr);
+            _ptr = _ptr->move_to(_ptr, _storage, sizeof(_storage));
+            return *this;
+        }
+        const size_t size = _ptr->size;
+        const size_t alignment = _ptr->alignment;
+        __destroy_uncheck();
+        if(other.__is_allocated()){
+            if(__is_allocated())
+                __free_uncheck();
+            _ptr = std::exchange(other._ptr, nullptr);
+            return *this;
+        }
+        if(__is_allocated()){
+            if(other._ptr->size > size || other._ptr->alignment > alignment){
+                __free_uncheck();
+                _ptr = std::exchange(other._ptr, nullptr);
+                _ptr = _ptr->move_to(_ptr, _storage, sizeof(_storage));
+                return *this;
+            }
+            void *heap_ptr = _ptr;
+            const __any_base::__free_fn free_fn = _ptr->free;
+            _ptr = std::exchange(other._ptr, nullptr);
+            _ptr = _ptr->move_to(_ptr, heap_ptr, size);
+            _ptr->free = free_fn;
+            assert(_ptr == heap_ptr);
+            return *this;
+        }
+        _ptr = std::exchange(other._ptr, nullptr);
+        _ptr = _ptr->move_to(_ptr, _storage, sizeof(_storage));
+        return *this;
+    }
+
+    ~__any_t(){
+        reset();
+    }
+
+    template<class T>
+        requires (!std::is_same_v<std::decay_t<T>, __any_t> && std::is_nothrow_move_constructible_v<T>)
+    __any_t(T&& val){
+        __emplace<T>(std::forward<T>(val));
+    }
+
+    template<class T>
+        requires (!std::is_same_v<std::decay_t<T>, __any_t> && std::is_nothrow_move_constructible_v<T>)
+    __any_t& operator=(T&& val){
+        __emplace<T>(std::forward<T>(val));
+        return *this;
+    }
+
+    template<class T, class ...Args>
+        requires std::is_nothrow_move_constructible_v<T>
+    std::decay_t<T>& emplace(Args&& ...args){
+        return __emplace<T>(std::forward<Args>(args)...);
+    }
+
+    bool has_value()const noexcept{ 
+        return _ptr != nullptr; 
+    }
+
+    void reset()noexcept{ 
+        if(_ptr){
+            __destroy_uncheck();
+            if(__is_allocated())
+                __free_uncheck();
+            _ptr = nullptr;
+        }
+    }
+
+    template<class T>
+    T &get()& noexcept{
+        return *((T*)_ptr->get(_ptr));
+    }
+
+    template<class T>
+    const T &get()const& noexcept{
+        return *((const T*)_ptr->get(_ptr));
+    }
+
+    template<class T>
+    T&& get()&& noexcept{
+        return std::move(*((T*)_ptr->get(_ptr)));
+    }
+
+    template<class T>
+    const T&& get()const&& noexcept{
+        return static_cast<const T&&>(*((const T*)_ptr->get(_ptr)));
+    }
+
+    friend void swap(__any_t& x, __any_t& y)noexcept{
+        if(!x._ptr){
+            if(!y._ptr)
+                return;       
+            if(y.__is_allocated()){
+                x._ptr = std::exchange(y._ptr, nullptr);
+                return;
+            }
+            x._ptr = std::exchange(y._ptr, nullptr);
+            x._ptr = x._ptr->move_to(x._ptr, x._storage, sizeof(x._storage));
+            return;
+        }
+        if(!y._ptr){
+            return swap(y, x);
+        }
+        if(x.__is_allocated()){
+            if(y.__is_allocated()){
+                std::swap(x._ptr, y._ptr);
+                return;
+            }
+            std::swap(x._ptr, y._ptr);
+            x._ptr = x._ptr->move_to(x._ptr, x._storage, sizeof(x._storage));
+            return;
+        }
+        if(y.__is_allocated()){
+            return swap(y, x);
+        }
+        alignas(16) char tmp[128];
+        auto tmp_ptr = x._ptr->move_to(x._ptr, tmp, sizeof(tmp));
+        x._ptr = y._ptr->move_to(y._ptr, x._storage, sizeof(x._storage));
+        y._ptr = tmp_ptr->move_to(tmp_ptr, y._storage, sizeof(y._storage));
+    }
+
+private:
+    template<class T, class ...Args>
+    std::decay_t<T>& __emplace(Args&& ...args){
+        using impl_t = __any_impl<std::decay_t<T>>;
+        if(!_ptr){
+            void *impl = __get_align_ptr<T>(_storage, sizeof(_storage));
+            if(!impl){
+                impl = __allocate<T>();
+            }
+            _ptr = (__any_base*)impl;
+            const __any_base::__free_fn free_fn = impl_t::__free; 
+            __guard guard{[free_fn, this]()mutable noexcept{
+                if(__is_allocated())
+                    free_fn(_ptr);
+                _ptr = nullptr;
+            }};
+            new (_ptr) impl_t(std::forward<Args>(args)...);
+            guard.reset();
+            return get<std::decay_t<T>>();
+        }
+        __destroy_uncheck();
+        if(__is_allocated() &&
+            sizeof(impl_t) <= _ptr->size &&
+            alignof(impl_t) <= _ptr->alignment)
+        {
+            const __any_base::__free_fn free_fn = _ptr->free;
+            __guard guard{[free_fn, this]()mutable noexcept{
+                free_fn(_ptr);
+                _ptr = nullptr;
+            }};
+            new (_ptr) impl_t(std::forward<Args>(args)...);
+            _ptr->free = free_fn;
+            guard.reset();
+            return get<std::decay_t<T>>();
+        }
+        _ptr = nullptr;
+        return __emplace<T>(std::forward<Args>(args)...);
+    }
+
+    bool __is_allocated()const noexcept{
+        const auto ptr = (char*)_ptr;
+        return ptr && !(_storage <= ptr && ptr < _storage + sizeof(_storage));
+    }
+
+    template<class T>
+    static void *__allocate(){
+        using impl_t = __any_impl<std::decay_t<T>>;
+        std::allocator<impl_t> allocator;
+        return allocator.allocate(1);
+    }
+
+    template<class T>
+    static void *__get_align_ptr(void *buf, size_t size)noexcept{
+        using impl_t = __any_impl<std::decay_t<T>>;
+        return std::align(alignof(impl_t), sizeof(impl_t), buf, size);
+    }
+
+    void __destroy_uncheck()noexcept{
+        _ptr->destroy(_ptr);
+    }
+
+    void __destroy()noexcept{
+        if(_ptr)
+            __destroy_uncheck();
+    }
+
+    void __free_uncheck()noexcept{
+        _ptr->free(_ptr);
+    }
+
+    void __free()noexcept{
+        if(__is_allocated())
+            __free_uncheck();
+        _ptr = nullptr;
+    }
+
+    __any_base *_ptr{nullptr};
+    alignas(16) char _storage[128];
+};
+
 template<class ...Args>
 struct __initializer{
-    using handler_t = std::variant<use_sender_handler_base<Args...>, use_sender_handler<Args...>>;
+private:
+    struct __init_base{
+        virtual ~__init_base()noexcept = default;
+        virtual void init(use_sender_handler_base<Args...>&&) = 0;
+        virtual void init(use_sender_handler<Args...>&&) = 0;
+    };
+
+    template<class Init, class ...InitArgs>
+    struct __init_impl: __init_base{
+        Init _init;
+        std::tuple<InitArgs...> _args;
+
+        __init_impl(Init init, InitArgs ...args): 
+            _init{std::move(init)}, 
+            _args{std::move(args)...}
+        {}
+
+        __init_impl(const __init_impl&) = delete;
+        __init_impl& operator=(const __init_impl&) = delete;
+        __init_impl(__init_impl&&)noexcept = default;
+        __init_impl& operator=(__init_impl&&)noexcept = default;
+
+        void init(use_sender_handler_base<Args...>&& handler) override{
+            std::apply(std::move(_init), std::tuple_cat(std::make_tuple(std::move(handler)), std::move(_args)));
+        }
+
+        void init(use_sender_handler<Args...>&& handler) override{
+            std::apply(std::move(_init), std::tuple_cat(std::make_tuple(std::move(handler)), std::move(_args)));
+        }
+    };
+public:
     using executor_type = ASIO::any_io_executor;
 
     template<class Init, class ...InitArgs>
-        requires std::is_convertible_v<std::decay_t<decltype(ASIO::get_associated_executor(std::declval<Init>()))>, executor_type>
-    __initializer(Init&& init, InitArgs&& ...args){
-        _ex = ASIO::get_associated_executor(init);
-        _init = [init = std::forward<Init>(init), ...args = std::forward<InitArgs>(args)]
-                (handler_t handler)mutable{
-                    std::visit([&](auto& h){
-                        std::move(init)(std::move(h), std::move(args)...);
-                    }, handler);
-                };
+        requires std::is_convertible_v<typename ASIO::associated_executor<Init>::type, executor_type>
+    __initializer(Init&& init, InitArgs&& ...args):
+        _ex{ASIO::get_associated_executor(init)}
+    {
+        _data.emplace<__init_impl<std::decay_t<Init>, std::decay_t<InitArgs>...>>(std::forward<Init>(init), std::forward<InitArgs>(args)...);
     }
 
     template<class Init>
-        requires std::is_convertible_v<std::decay_t<decltype(ASIO::get_associated_executor(std::declval<Init>()))>, executor_type>
-    __initializer(Init&& init){
-        _ex = ASIO::get_associated_executor(init);
-        _init = [init = std::forward<Init>(init)]
-                (handler_t handler)mutable{
-                    std::visit([&](auto& h){
-                        std::move(init)(std::move(h));
-                    }, handler);
-                };
+        requires std::is_convertible_v<typename ASIO::associated_executor<Init>::type, executor_type>
+    __initializer(Init&& init):
+        _ex{ASIO::get_associated_executor(init)}
+    {
+        _data.emplace<__init_impl<std::decay_t<Init>>>(std::forward<Init>(init));
     }
 
     __initializer(const __initializer&) = delete;
     __initializer& operator=(const __initializer&) = delete;
-    __initializer(__initializer&&) = default;
+    
+    __initializer(__initializer&& other)noexcept:
+        _data{std::move(other._data)},
+        _ex{other._ex}
+    {}
 
-    void operator()(handler_t handler){
-        std::move(_init)(std::move(handler));
+    void operator()(use_sender_handler_base<Args...>&& handler){
+        _data.get<__init_base>().init(std::move(handler));
+    }
+
+    void operator()(use_sender_handler<Args...>&& handler){
+        _data.get<__init_base>().init(std::move(handler));
     }
 
     const executor_type& get_executor()const noexcept{ return _ex; }
     executor_type& get_executor()noexcept{ return _ex; }
 private:
-    std::move_only_function<void(handler_t)> _init;
+    __any_t _data;
     executor_type _ex;
 };
 
@@ -416,7 +791,7 @@ constexpr std::string_view __type_name(){
 
 template<class ...Args>
 struct __sender{
-    using is_sender = __sender;
+    using sender_concept = STDEXEC::sender_t;
 
     __initializer<Args...> _init;
 
@@ -440,12 +815,10 @@ struct __sender{
         __operation_base& operator=(__operation_base&&) = delete;
 
         template<class Tag>
-            requires (std::is_same_v<Tag, STDEXEC::set_value_t> ||
-                        std::is_same_v<Tag, STDEXEC::set_error_t> ||
-                        std::is_same_v<Tag, STDEXEC::set_stopped_t>)
         struct __completion_task_t {
-            __operation_base *self;
             using allocator_type = std::pmr::polymorphic_allocator<>;
+
+            __operation_base *self;
             allocator_type allocator;
 
             allocator_type get_allocator() const noexcept { return allocator; }
@@ -455,8 +828,10 @@ struct __sender{
                     std::apply(STDEXEC::set_value, std::tuple_cat(std::make_tuple(std::move(self->_r)), std::move(*self->_res)));
                 }else if constexpr(std::is_same_v<Tag, STDEXEC::set_error_t>){
                     STDEXEC::set_error(std::move(self->_r), std::move(self->_err));
-                }else {
+                }else if constexpr(std::is_same_v<Tag, STDEXEC::set_stopped_t>){
                     STDEXEC::set_stopped(std::move(self->_r));
+                }else{
+                    std::terminate();
                 }
             }
         };
@@ -514,7 +889,6 @@ struct __sender{
             }
             __value();
         }
-
     };
 
     template<STDEXEC::receiver R>
@@ -543,7 +917,6 @@ struct __sender{
         };
 
         using __stop_callback_t = typename STDEXEC::stop_token_of_t<STDEXEC::env_of_t<R>&>:: template callback_type<__stop_t>;
-
         std::optional<__stop_callback_t> _stop_callback{};
 
         void __init(){
@@ -596,22 +969,15 @@ struct __sender{
     };
 
     struct __transfer_sender {
-        using is_sender = __transfer_sender;
+        using sender_concept = STDEXEC::sender_t;
 
-        using __completion_signatures = STDEXEC::completion_signatures<
-            STDEXEC::set_value_t(Args&&...),
+        using completion_signatures = STDEXEC::completion_signatures<
+            STDEXEC::set_value_t(Args...),
             STDEXEC::set_error_t(std::exception_ptr),
             STDEXEC::set_stopped_t()
         >;
 
-        template<class Env>
-        friend auto tag_invoke(STDEXEC::get_completion_signatures_t, const __transfer_sender&, Env)noexcept
-            -> __completion_signatures{ 
-            return {}; 
-        }
-
         __initializer<Args...> _init;
-        
 
         template<STDEXEC::receiver R>
         struct __transfer_op_without_cancellation: __operation_base<R> {
@@ -671,8 +1037,8 @@ struct __sender{
         auto sched = STDEXEC::get_scheduler(env);
 
         if constexpr(std::is_same_v<std::decay_t<decltype(sched)>, asio2exec::asio_context::scheduler_t>){
-            const auto& ex = sched._ctx->get_executor().get_executor();
-            const auto &associated_executor = ASIO::get_associated_executor(self._init);
+            const ASIO::any_io_executor ex = sched._ctx->get_executor().get_executor();
+            const ASIO::any_io_executor& associated_executor = ASIO::get_associated_executor(self._init);
             if constexpr(STDEXEC::unstoppable_token<STDEXEC::stop_token_of_t<STDEXEC::env_of_t<R>>>){
                 return __asio_op_without_cancellation<R>(
                     std::move(self._init),
@@ -699,17 +1065,11 @@ struct __sender{
         }
     }
 
-    using __completion_signatures = STDEXEC::completion_signatures<
-        STDEXEC::set_value_t(Args&&...),
+    using completion_signatures = STDEXEC::completion_signatures<
+        STDEXEC::set_value_t(Args...),
         STDEXEC::set_error_t(std::exception_ptr),
         STDEXEC::set_stopped_t()
     >;
-
-    template<class Env>
-    friend auto tag_invoke(STDEXEC::get_completion_signatures_t, const __sender&, Env)noexcept
-        -> __completion_signatures{ 
-        return {}; 
-    }
 }; // __sender
 
 }// __detail
@@ -719,25 +1079,23 @@ __detail::scheduler_t asio_context::get_scheduler()noexcept { return __detail::s
 }// asio2exec
 
 namespace ASIO {
-
     template<class ...Args>
     struct async_result<asio2exec::use_sender_t, void(Args...)> {
         using return_type = asio2exec::__detail::__sender<Args...>;
 
         template<class Initiation, class ...InitArgs>
-        static return_type initiate(
+        static STDEXEC::sender auto initiate(
             Initiation&& init,
             asio2exec::use_sender_t,
             InitArgs&& ...args
         ){
             return return_type{
-                ._init{asio2exec::__detail::__initializer<Args...>(
+                asio2exec::__detail::__initializer<Args...>(
                     std::forward<Initiation>(init),
                     std::forward<InitArgs>(args)...
-                )},
+                )
             };
         }
 
     };
-
 } // ASIO
