@@ -63,9 +63,6 @@ namespace __io = boost::asio;
 
 namespace __detail{ 
     struct scheduler_t; 
-
-    template<class ...Args>
-    struct __sender;
 }
 
 class asio_context {
@@ -83,9 +80,7 @@ public:
     asio_context& operator=(asio_context&&) = delete;
 
     ~asio_context() {
-        stop();
-        if(_th.joinable())
-            _th.join();
+        join();
     }
 
     void start() {
@@ -98,15 +93,21 @@ public:
         _guard.reset();
     }
 
+    void join(){
+        stop();
+        if(_th.joinable())
+            _th.join();
+    }
+
     __detail::scheduler_t get_scheduler()noexcept;
 
     __io::io_context& get_executor()noexcept { return _ctx; }
     const __io::io_context& get_executor()const noexcept { return _ctx; }
 
 private:
-    __io::io_context _ctx;
+    __io::io_context _ctx{};
     __io::executor_work_guard<__io::io_context::executor_type> _guard;
-    std::thread _th;
+    std::thread _th{};
 };
 
 struct use_sender_t 
@@ -147,7 +148,7 @@ inline constexpr use_sender_t use_sender{};
 namespace __detail {
 
 template<size_t Size = 64ull, size_t Alignment = 16>
-class __sbo_buffer: public std::pmr::memory_resource {
+class __sbo_buffer final: public std::pmr::memory_resource {
 public:
     explicit __sbo_buffer(std::pmr::memory_resource* upstream =  std::pmr::get_default_resource())noexcept:
         _upstream{upstream}
@@ -161,7 +162,7 @@ public:
 private:
     void* do_allocate(size_t bytes, size_t alignment) override{
         if(_used || bytes > Size || alignment > Alignment){
-            assert(("Upstream memory_resource is empty.", _upstream));
+            assert(_upstream && "Upstream memory_resource is empty.");
             return _upstream->allocate(bytes, alignment);
         }
         _used = true;
@@ -280,7 +281,6 @@ struct __op_base{
     __op_base& operator=(const __op_base&) = delete;
     __op_base& operator=(__op_base&&) = delete;
     virtual void complete(Args ...args)noexcept{};
-    virtual ~__op_base(){}
 };  
     
 template<class ...Args>
@@ -305,370 +305,228 @@ struct use_sender_handler: use_sender_handler_base<Args...> {
     cancellation_slot_type get_cancellation_slot() const noexcept { return slot; }
 };
 
-struct __any_t{
+// Copyright Ruslan Arutyunyan, 2019-2021.
+// Copyright Antony Polukhin, 2021-2023.
+//
+// Distributed under the Boost Software License, Version 1.0. (See
+// accompanying file LICENSE_1_0.txt or copy at
+// http://www.boost.org/LICENSE_1_0.txt)
+
+// Contributed by Ruslan Arutyunyan
+
+template <std::size_t OptimizeForSize, std::size_t OptimizeForAlignment>
+class basic_any{
+    static_assert(OptimizeForSize > 0 && OptimizeForAlignment > 0, "Size and Align shall be positive values");
+    static_assert(OptimizeForSize >= OptimizeForAlignment, "Size shall non less than Align");
+    static_assert((OptimizeForAlignment & (OptimizeForAlignment - 1)) == 0, "Align shall be a power of 2");
+    static_assert(OptimizeForSize % OptimizeForAlignment == 0, "Size shall be multiple of alignment");
 private:
-    struct __any_base {
-        using __move_to_fn = __any_base* (*)(__any_base*, void *buf, size_t size)noexcept;
-        using __get_fn = void* (*)(__any_base*)noexcept;
-        using __destroy_fn = void (*)(__any_base*)noexcept;
-        using __free_fn = void (*)(__any_base*)noexcept;
-
-        __move_to_fn move_to{nullptr};
-        __get_fn get{nullptr};
-        __destroy_fn destroy{nullptr};
-        __free_fn free{nullptr};
-        size_t size{0};
-        size_t alignment{0};
-
-        __any_base() = default;
-
-        __any_base(const __any_base&) = delete;
-        __any_base& operator=(const __any_base&) = delete;
-
-        __any_base(__any_base&& other)noexcept{}
-        __any_base& operator=(__any_base&& other)noexcept = default;
+    /// @cond
+    enum operation{
+        Destroy,
+        Move,
+        UnsafeCast
     };
 
-    template<class T>
-        requires std::is_nothrow_move_constructible_v<T>
-    struct __any_impl: __any_base{
-        union{
-            T _val;
-        };
-
-        __any_impl()noexcept{
-            move_to = __move_to;
-            get = __get;
-            destroy = __destroy;
-            free = __free;
-            size = sizeof(__any_impl);
-            alignment = alignof(__any_impl);
-        }
-
-        template<class ..._Args>
-        __any_impl(_Args&&... args)noexcept(std::is_nothrow_constructible_v<T, _Args...>):
-            _val(std::forward<_Args>(args)...)
+    template <typename ValueType>
+    static void* small_manager(operation op, basic_any& left, const basic_any* right){
+        switch (op)
         {
-            move_to = __move_to;
-            get = __get;
-            destroy = __destroy;
-            free = __free;
-            size = sizeof(__any_impl);
-            alignment = alignof(__any_impl);
+            case Destroy:
+                reinterpret_cast<ValueType*>(&left.content.small_value)->~ValueType();
+                break;
+            case Move: {
+                ValueType* value = reinterpret_cast<ValueType*>(&const_cast<basic_any*>(right)->content.small_value);
+                new (&left.content.small_value) ValueType(std::move(*value));
+                left.man = right->man;
+                reinterpret_cast<ValueType const*>(&right->content.small_value)->~ValueType();
+                const_cast<basic_any*>(right)->man = 0;
+            };
+                break;
+            case UnsafeCast:
+                return reinterpret_cast<typename std::remove_cv<ValueType>::type *>(&left.content.small_value);
         }
-
-        __any_impl(__any_impl&& other) = delete;
-        __any_impl& operator=(__any_impl&& other) = delete;
-
-        static __any_base *__move_to(__any_base* base, void *buf, size_t size)noexcept{
-            auto self = (__any_impl*)base;
-            auto impl = (__any_impl*)std::align(alignof(__any_impl), sizeof(__any_impl), buf, size);
-            assert(impl);
-            if constexpr(!std::is_trivially_move_constructible_v<T>){
-                new (impl) __any_impl(std::move(self->_val));
-            }else{
-                new (impl) __any_impl;
-                std::memcpy(std::addressof(impl->_val), std::addressof(self->_val), sizeof(T));
-            }
-            if constexpr(!std::is_trivially_destructible_v<T>){
-                self->_val.~T();
-            }
-            return impl;
-        }
-
-        static void *__get(__any_base* base)noexcept{
-            return std::addressof(((__any_impl*)base)->_val);
-        }
-
-        static void __destroy(__any_base* base)noexcept{
-            if constexpr(!std::is_trivially_destructible_v<T>){
-                auto self = (__any_impl*)base;
-                self->_val.~T();
-            }
-        }
-
-        static void __free(__any_base* base)noexcept{
-            std::allocator<__any_impl> allocator;
-            allocator.deallocate((__any_impl*)base, 1);
-        }
-    };
-
-    template<class F>
-        requires (std::is_nothrow_invocable_v<F> && 
-                    std::is_nothrow_move_constructible_v<F>)
-    struct __guard{
-        F _f;
-        bool _valid{true};
-
-        explicit __guard(F&& f)noexcept:
-            _f{std::move(f)}
-        {}
-
-        __guard(const __guard&) = delete;
-        __guard& operator=(const __guard&) = delete;
-        __guard(__guard&& other) = delete;
-        __guard& operator=(__guard&& other) = delete;
-
-        ~__guard()noexcept{
-            if(_valid){
-                _f();
-            }
-        }
-
-        void reset()noexcept{
-            _valid = false;
-        }
-    };
-    
-public:
-    __any_t()noexcept = default;
-
-    __any_t(const __any_t&) = delete;
-    __any_t& operator=(const __any_t&) = delete;
-
-    __any_t(__any_t&& other)noexcept{
-        if(!other._ptr){
-            return;
-        }
-        if(other.__is_allocated()){
-            _ptr = std::exchange(other._ptr, nullptr);
-            return;
-        }
-        _ptr = std::exchange(other._ptr, nullptr);
-        _ptr = _ptr->move_to(_ptr, _storage, sizeof(_storage));
+        return 0;
     }
 
-    __any_t& operator=(__any_t&& other)noexcept{
-        if(this == &other)
-            return *this;
-        if(!other._ptr){
-            reset();
+    template <typename ValueType>
+    static void* large_manager(operation op, basic_any& left, const basic_any* right){
+        switch (op)
+        {
+            case Destroy:
+                delete static_cast<ValueType*>(left.content.large_value);
+                break;
+            case Move:
+                left.content.large_value = right->content.large_value;
+                left.man = right->man;
+                const_cast<basic_any*>(right)->content.large_value = 0;
+                const_cast<basic_any*>(right)->man = 0;
+                break;
+            case UnsafeCast:
+                return reinterpret_cast<typename std::remove_cv<ValueType>::type *>(left.content.large_value);
+        }
+        return 0;
+    }
+
+    template <typename ValueType>
+    struct is_small_object : std::integral_constant<bool, sizeof(ValueType) <= OptimizeForSize &&
+        alignof(ValueType) <= OptimizeForAlignment &&
+        std::is_nothrow_move_constructible<ValueType>::value>
+    {};
+
+    template <typename ValueType>
+    static void create(basic_any& any, ValueType&& value, std::true_type){
+        typedef typename std::decay<const ValueType>::type DecayedType;
+        any.man = &small_manager<DecayedType>;
+        new (&any.content.small_value) DecayedType(std::forward<ValueType>(value));
+    }
+
+    template <typename ValueType>
+    static void create(basic_any& any, ValueType&& value, std::false_type){
+        typedef typename std::decay<const ValueType>::type DecayedType;
+        any.man = &large_manager<DecayedType>;
+        any.content.large_value = new DecayedType(std::forward<ValueType>(value));
+    }
+    /// @endcond
+
+public: // non-type template parameters accessors
+        static constexpr std::size_t buffer_size = OptimizeForSize;
+        static constexpr std::size_t buffer_align = OptimizeForAlignment;
+
+public: // structors
+
+    /// \post this->empty() is true.
+    constexpr basic_any() noexcept
+        : man(0), content()
+    {
+    }
+
+    basic_any(basic_any&& other) noexcept
+        : man(0), content()
+    {
+        if (other.man){
+            other.man(Move, *this, &other);
+        }
+    }
+
+    template<typename ValueType>
+    basic_any(ValueType&& value
+        , typename std::enable_if<!std::is_same<basic_any&, ValueType>::value >::type* = 0 // disable if value has type `basic_any&`
+        , typename std::enable_if<!std::is_const<ValueType>::value >::type* = 0) // disable if value has type `const ValueType&&`
+        : man(0), content(){
+        typedef typename std::decay<ValueType>::type DecayedType;
+        static_assert(
+            !std::is_same<DecayedType, basic_any>::value,
+            "basic_any shall not be constructed from basic_any"
+        );
+        create(*this, static_cast<ValueType&&>(value), is_small_object<DecayedType>());
+    }
+
+    ~basic_any() noexcept{
+        if (man){
+            man(Destroy, *this, 0);
+        }
+    }
+
+public: // modifiers
+    basic_any & swap(basic_any & rhs) noexcept{
+        if (this == &rhs){
             return *this;
         }
-        if(!_ptr){
-            if(other.__is_allocated()){
-                _ptr = std::exchange(other._ptr, nullptr);
-                return *this;
-            }
-            _ptr = std::exchange(other._ptr, nullptr);
-            _ptr = _ptr->move_to(_ptr, _storage, sizeof(_storage));
-            return *this;
+
+        if (man && rhs.man){
+            basic_any tmp;
+            rhs.man(Move, tmp, &rhs);
+            man(Move, rhs, this);
+            tmp.man(Move, *this, &tmp);
         }
-        const size_t size = _ptr->size;
-        const size_t alignment = _ptr->alignment;
-        __destroy_uncheck();
-        if(other.__is_allocated()){
-            if(__is_allocated())
-                __free_uncheck();
-            _ptr = std::exchange(other._ptr, nullptr);
-            return *this;
+        else if (man){
+            man(Move, rhs, this);
         }
-        if(__is_allocated()){
-            if(other._ptr->size > size || other._ptr->alignment > alignment){
-                __free_uncheck();
-                _ptr = std::exchange(other._ptr, nullptr);
-                _ptr = _ptr->move_to(_ptr, _storage, sizeof(_storage));
-                return *this;
-            }
-            void *heap_ptr = _ptr;
-            const __any_base::__free_fn free_fn = _ptr->free;
-            _ptr = std::exchange(other._ptr, nullptr);
-            _ptr = _ptr->move_to(_ptr, heap_ptr, size);
-            _ptr->free = free_fn;
-            assert(_ptr == heap_ptr);
-            return *this;
+        else if (rhs.man){
+            rhs.man(Move, *this, &rhs);
         }
-        _ptr = std::exchange(other._ptr, nullptr);
-        _ptr = _ptr->move_to(_ptr, _storage, sizeof(_storage));
         return *this;
     }
 
-    ~__any_t(){
-        reset();
-    }
-
-    template<class T>
-        requires (!std::is_same_v<std::decay_t<T>, __any_t> && std::is_nothrow_move_constructible_v<T>)
-    __any_t(T&& val){
-        __emplace<T>(std::forward<T>(val));
-    }
-
-    template<class T>
-        requires (!std::is_same_v<std::decay_t<T>, __any_t> && std::is_nothrow_move_constructible_v<T>)
-    __any_t& operator=(T&& val){
-        __emplace<T>(std::forward<T>(val));
+    basic_any & operator=(basic_any&& rhs) noexcept{
+        rhs.swap(*this);
+        basic_any().swap(rhs);
         return *this;
     }
 
-    template<class T, class ...Args>
-        requires std::is_nothrow_move_constructible_v<T>
-    std::decay_t<T>& emplace(Args&& ...args){
-        return __emplace<T>(std::forward<Args>(args)...);
+    template <class ValueType>
+    basic_any & operator=(ValueType&& rhs){
+        typedef typename std::decay<ValueType>::type DecayedType;
+        static_assert(
+            !std::is_same<DecayedType, basic_any>::value,
+            "basic_any shall not be assigned into basic_any"
+        );
+        basic_any(std::forward<ValueType>(rhs)).swap(*this);
+        return *this;
     }
 
-    bool has_value()const noexcept{ 
-        return _ptr != nullptr; 
+public: // queries
+    bool empty() const noexcept{
+        return !man;
     }
 
-    void reset()noexcept{ 
-        if(_ptr){
-            __destroy_uncheck();
-            if(__is_allocated())
-                __free_uncheck();
-            _ptr = nullptr;
-        }
+    /// \post this->empty() is true
+    void clear() noexcept{
+        basic_any().swap(*this);
     }
 
-    template<class T>
-    T &get()& noexcept{
-        return *((T*)_ptr->get(_ptr));
-    }
+private: // representation
 
-    template<class T>
-    const T &get()const& noexcept{
-        return *((const T*)_ptr->get(_ptr));
-    }
+    template<typename ValueType, std::size_t Size, std::size_t Alignment>
+    friend ValueType * unsafe_any_cast(basic_any<Size, Alignment> *) noexcept;
 
-    template<class T>
-    T&& get()&& noexcept{
-        return std::move(*((T*)_ptr->get(_ptr)));
-    }
+    typedef void*(*manager)(operation op, basic_any& left, const basic_any* right);
 
-    template<class T>
-    const T&& get()const&& noexcept{
-        return static_cast<const T&&>(*((const T*)_ptr->get(_ptr)));
-    }
+    manager man;
 
-    friend void swap(__any_t& x, __any_t& y)noexcept{
-        if(!x._ptr){
-            if(!y._ptr)
-                return;       
-            if(y.__is_allocated()){
-                x._ptr = std::exchange(y._ptr, nullptr);
-                return;
-            }
-            x._ptr = std::exchange(y._ptr, nullptr);
-            x._ptr = x._ptr->move_to(x._ptr, x._storage, sizeof(x._storage));
-            return;
-        }
-        if(!y._ptr){
-            return swap(y, x);
-        }
-        if(x.__is_allocated()){
-            if(y.__is_allocated()){
-                std::swap(x._ptr, y._ptr);
-                return;
-            }
-            std::swap(x._ptr, y._ptr);
-            x._ptr = x._ptr->move_to(x._ptr, x._storage, sizeof(x._storage));
-            return;
-        }
-        if(y.__is_allocated()){
-            return swap(y, x);
-        }
-        alignas(16) char tmp[128];
-        auto tmp_ptr = x._ptr->move_to(x._ptr, tmp, sizeof(tmp));
-        x._ptr = y._ptr->move_to(y._ptr, x._storage, sizeof(x._storage));
-        y._ptr = tmp_ptr->move_to(tmp_ptr, y._storage, sizeof(y._storage));
-    }
-
-private:
-    template<class T, class ...Args>
-    std::decay_t<T>& __emplace(Args&& ...args){
-        using impl_t = __any_impl<std::decay_t<T>>;
-        if(!_ptr){
-            void *impl = __get_align_ptr<T>(_storage, sizeof(_storage));
-            if(!impl){
-                impl = __allocate<T>();
-            }
-            _ptr = (__any_base*)impl;
-            const __any_base::__free_fn free_fn = impl_t::__free; 
-            __guard guard{[free_fn, this]()mutable noexcept{
-                if(__is_allocated())
-                    free_fn(_ptr);
-                _ptr = nullptr;
-            }};
-            new (_ptr) impl_t(std::forward<Args>(args)...);
-            guard.reset();
-            return get<std::decay_t<T>>();
-        }
-        __destroy_uncheck();
-        if(__is_allocated() &&
-            sizeof(impl_t) <= _ptr->size &&
-            alignof(impl_t) <= _ptr->alignment)
-        {
-            const __any_base::__free_fn free_fn = _ptr->free;
-            __guard guard{[free_fn, this]()mutable noexcept{
-                free_fn(_ptr);
-                _ptr = nullptr;
-            }};
-            new (_ptr) impl_t(std::forward<Args>(args)...);
-            _ptr->free = free_fn;
-            guard.reset();
-            return get<std::decay_t<T>>();
-        }
-        _ptr = nullptr;
-        return __emplace<T>(std::forward<Args>(args)...);
-    }
-
-    bool __is_allocated()const noexcept{
-        const auto ptr = (char*)_ptr;
-        return ptr && !(_storage <= ptr && ptr < _storage + sizeof(_storage));
-    }
-
-    template<class T>
-    static void *__allocate(){
-        using impl_t = __any_impl<std::decay_t<T>>;
-        std::allocator<impl_t> allocator;
-        return allocator.allocate(1);
-    }
-
-    template<class T>
-    static void *__get_align_ptr(void *buf, size_t size)noexcept{
-        using impl_t = __any_impl<std::decay_t<T>>;
-        return std::align(alignof(impl_t), sizeof(impl_t), buf, size);
-    }
-
-    void __destroy_uncheck()noexcept{
-        _ptr->destroy(_ptr);
-    }
-
-    void __destroy()noexcept{
-        if(_ptr)
-            __destroy_uncheck();
-    }
-
-    void __free_uncheck()noexcept{
-        _ptr->free(_ptr);
-    }
-
-    void __free()noexcept{
-        if(__is_allocated())
-            __free_uncheck();
-        _ptr = nullptr;
-    }
-
-    __any_base *_ptr{nullptr};
-    alignas(16) char _storage[128];
+    union content {
+        void * large_value;
+        alignas(OptimizeForAlignment) unsigned char small_value[OptimizeForSize];
+    } content;
+    /// @endcond
 };
+
+/// Exchange of the contents of `lhs` and `rhs`.
+/// \throws Nothing.
+template<std::size_t OptimizeForSize, std::size_t OptimizeForAlignment>
+inline void swap(basic_any<OptimizeForSize, OptimizeForAlignment>& lhs, basic_any<OptimizeForSize, OptimizeForAlignment>& rhs) noexcept{
+    lhs.swap(rhs);
+}
+
+template<typename ValueType, std::size_t OptimizedForSize, std::size_t OptimizeForAlignment>
+inline ValueType * unsafe_any_cast(basic_any<OptimizedForSize, OptimizeForAlignment> * operand) noexcept{
+    return static_cast<ValueType*>(operand->man(basic_any<OptimizedForSize, OptimizeForAlignment>::UnsafeCast, *operand, 0));
+}
+
+template<typename ValueType, std::size_t OptimizeForSize, std::size_t OptimizeForAlignment>
+inline const ValueType * unsafe_any_cast(const basic_any<OptimizeForSize, OptimizeForAlignment> * operand) noexcept{
+    return unsafe_any_cast<ValueType>(const_cast<basic_any<OptimizeForSize, OptimizeForAlignment> *>(operand));
+}
 
 template<class ...Args>
 struct __initializer{
+    using __any_t = basic_any<256, 16>; 
 private:
     struct __init_base{
-        virtual ~__init_base()noexcept = default;
         virtual void init(use_sender_handler_base<Args...>&&) = 0;
         virtual void init(use_sender_handler<Args...>&&) = 0;
     };
 
     template<class Init, class ...InitArgs>
-    struct __init_impl: __init_base{
+    struct __init_impl final: __init_base{
         Init _init;
         std::tuple<InitArgs...> _args;
 
-        __init_impl(Init init, InitArgs ...args): 
-            _init{std::move(init)}, 
-            _args{std::move(args)...}
+        template<class _Init, class ..._InitArgs>
+        __init_impl(_Init&& init, _InitArgs&& ...args): 
+            _init{std::forward<_Init>(init)}, 
+            _args{std::forward<_InitArgs>(args)...}
         {}
 
         __init_impl(const __init_impl&) = delete;
@@ -687,12 +545,12 @@ private:
 public:
     template<class Init, class ...InitArgs>
     __initializer(Init&& init, InitArgs&& ...args){
-        _data.emplace<__init_impl<std::decay_t<Init>, std::decay_t<InitArgs>...>>(std::forward<Init>(init), std::forward<InitArgs>(args)...);
+        _data = __init_impl<std::decay_t<Init>, std::decay_t<InitArgs>...>(std::forward<Init>(init), std::forward<InitArgs>(args)...);
     }
 
     template<class Init>
     __initializer(Init&& init){
-        _data.emplace<__init_impl<std::decay_t<Init>>>(std::forward<Init>(init));
+        _data = __init_impl<std::decay_t<Init>>(std::forward<Init>(init));
     }
 
     __initializer(const __initializer&) = delete;
@@ -703,13 +561,12 @@ public:
     {}
 
     void operator()(use_sender_handler_base<Args...>&& handler){
-        _data.get<__init_base>().init(std::move(handler));
+        unsafe_any_cast<__init_base>(&_data)->init(std::move(handler));
     }
 
     void operator()(use_sender_handler<Args...>&& handler){
-        _data.get<__init_base>().init(std::move(handler));
+        unsafe_any_cast<__init_base>(&_data)->init(std::move(handler));
     }
-
 private:
     __any_t _data;
 };
@@ -720,21 +577,20 @@ concept __is_tuple = requires (T&& t){
 }; 
 
 template<class T>
-constexpr auto& __unwrap_first(T& t)noexcept{
-    return t;
+constexpr decltype(auto) __unwrap_first(T&& t)noexcept{
+    return std::forward<T>(t);
 }
 
 template<__is_tuple T>
-constexpr auto& __unwrap_first(T& t)noexcept{
-    using __first_t = typename std::tuple_element<0, T>::type;
-    return __unwrap_first<__first_t>(std::get<0>(t));
+constexpr decltype(auto) __unwrap_first(T&& t)noexcept{
+    return __unwrap_first(std::get<0>(std::forward<T>(t)));
 }
 
 template<class T>
 using __unwrap_first_t = std::decay_t<decltype(__unwrap_first(std::declval<T>()))>;
 
 template<__is_tuple T>
-constexpr auto&& __unwrap_tuple(T&& t)noexcept{
+constexpr decltype(auto) __unwrap_tuple(T&& t)noexcept{
     if constexpr(std::tuple_size<T>{} == size_t(1)){
         return __unwrap_tuple(std::get<0>(std::forward<T>(t)));
     }else{
@@ -743,7 +599,7 @@ constexpr auto&& __unwrap_tuple(T&& t)noexcept{
 }
 
 template<class T>
-constexpr auto&& __unwrap_tuple(T&& t)noexcept{
+constexpr decltype(auto) __unwrap_tuple(T&& t)noexcept{
     return std::make_tuple(std::forward<T>(t));
 }
 
@@ -773,42 +629,33 @@ constexpr const char *__type_name(){
 template<class ...Args>
 struct __sender{
     using sender_concept = __ex::sender_t;
+    using completion_signatures = __ex::completion_signatures<
+        __ex::set_value_t(Args...),
+        __ex::set_error_t(std::exception_ptr),
+        __ex::set_stopped_t()
+    >;
     __initializer<Args...> _init;
 
     template<__ex::receiver R>
     struct __operation_base: __op_base<Args...> {
-        using __init_or_res_t = std::variant<
+        using __storage_t = std::variant<
             __initializer<Args...>, 
-            std::tuple<Args...>, 
-            std::exception_ptr,
             __sbo_buffer<512, 64>
         >;
 
-        __init_or_res_t _init_or_res;
+        __storage_t _storage;
         R _r;
 
         __operation_base(__initializer<Args...>&& i, R&& r):
-            _init_or_res{std::move(i)}, _r{std::move(r)}
+            _storage{std::move(i)}, _r{std::move(r)}
         {}
 
         __initializer<Args...>& __get_initializer()noexcept{
-            return std::get<0>(_init_or_res);
+            return std::get<0>(_storage);
         }
 
         __sbo_buffer<512, 64>& __emplace_buffer()noexcept{
-            return _init_or_res.template emplace<3>();
-        }
-
-        void __emplace_result(Args&& ...args)noexcept{
-            _init_or_res.template emplace<1>(std::move(args)...);
-        }
-
-        void __emplace_error(std::exception_ptr e)noexcept{
-            _init_or_res.template emplace<2>(std::move(e));
-        }
-
-        void __value()noexcept{
-            std::apply(__ex::set_value, std::tuple_cat(std::make_tuple(std::move(_r)), std::move(std::get<1>(_init_or_res))));
+            return _storage.template emplace<1>();
         }
 
         void __stop()noexcept{
@@ -816,7 +663,7 @@ struct __sender{
         }
 
         void __error()noexcept{
-            __ex::set_error(std::move(_r), std::move(std::get<2>(_init_or_res)));
+            __ex::set_error(std::move(_r), std::current_exception());
         }
 
         void __init(){
@@ -828,20 +675,20 @@ struct __sender{
         }
 
         void complete(Args ...args)noexcept override{
-            __emplace_result(std::move(args)...);
-            using __first_t = __unwrap_first_t<std::tuple<Args...>&>;
-            if constexpr(std::is_convertible_v<__first_t, std::error_code>){
-                if(__unwrap_first(std::get<1>(_init_or_res)) == std::errc::operation_canceled){
+            const auto& res = std::tie(args...);
+            const auto& may_be_ec = __unwrap_first(res);
+            if constexpr(requires { may_be_ec == std::errc::operation_canceled; }){
+                if(may_be_ec == std::errc::operation_canceled){
                     __stop();
                     return;
                 }
             }
-            __value();
+            __ex::set_value(std::move(_r), std::move(args)...);
         }
     };
 
     template<__ex::receiver R>
-    struct __operation: __operation_base<R> {
+    struct __operation final: __operation_base<R> {
         __operation(__initializer<Args...>&& i, R&& r)
             : __operation_base<R>(std::move(i), std::move(r))
         {}
@@ -903,8 +750,7 @@ struct __sender{
                 self.__init();
             }catch(...){
                 self._stop_callback.reset();
-                // ???
-                __ex::set_error(std::move(self._r), std::current_exception());
+                self.__error();
                 return;
             }
             // 如果没有请求取消，self._state == __state_t::emplaced
@@ -919,7 +765,7 @@ struct __sender{
     };
 
     template<__ex::receiver R>
-    struct __asio_op_without_cancellation: __operation_base<R> {
+    struct __asio_op_without_cancellation final: __operation_base<R> {
         __asio_op_without_cancellation(__initializer<Args...>&& i, R&& r)
             : __operation_base<R>(std::move(i), std::move(r))
         {}
@@ -929,7 +775,7 @@ struct __sender{
                 self.__init();
             }
             catch (...) {
-                __ex::set_error(std::move(self._r), std::current_exception());
+                self.__error();
             }
         }
     };
@@ -945,7 +791,7 @@ struct __sender{
         __initializer<Args...> _init;
 
         template<__ex::receiver R>
-        struct __transfer_op_without_cancellation: __operation_base<R> {
+        struct __transfer_op_without_cancellation final: __operation_base<R> {
             __transfer_op_without_cancellation(__initializer<Args...>&& i, R&& r)
                 : __operation_base<R>(std::move(i), std::move(r))
             {}
@@ -956,7 +802,7 @@ struct __sender{
                     self.__init();
                 }
                 catch (...) {
-                    __ex::set_error(std::move(self._r), std::current_exception());
+                    self.__error();
                 }
             }
         };
@@ -964,12 +810,12 @@ struct __sender{
         template<__ex::receiver R>
         friend __ex::operation_state auto tag_invoke(__ex::connect_t, __transfer_sender&& self, R&& r){
             if constexpr(__ex::unstoppable_token<__ex::stop_token_of_t<__ex::env_of_t<R>>>){
-                return __transfer_op_without_cancellation<R>(
+                return __transfer_op_without_cancellation<std::decay_t<R>>(
                     std::move(self._init),
                     std::forward<R>(r)
                 );
             }else{
-                return __operation<R>(
+                return __operation<std::decay_t<R>>(
                     std::move(self._init),
                     std::forward<R>(r)
                 );
@@ -1001,11 +847,6 @@ struct __sender{
         }
     }
 
-    using completion_signatures = __ex::completion_signatures<
-        __ex::set_value_t(Args...),
-        __ex::set_error_t(std::exception_ptr),
-        __ex::set_stopped_t()
-    >;
 }; // __sender
 
 }// __detail
