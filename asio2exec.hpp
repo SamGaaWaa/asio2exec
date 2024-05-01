@@ -851,7 +851,7 @@ struct __sender{
 
 }// __detail
 
-__detail::scheduler_t asio_context::get_scheduler()noexcept { return __detail::scheduler_t{ this }; }
+inline __detail::scheduler_t asio_context::get_scheduler()noexcept { return __detail::scheduler_t{ this }; }
 
 }// asio2exec
 
