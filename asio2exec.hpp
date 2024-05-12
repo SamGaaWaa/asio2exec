@@ -73,12 +73,11 @@ public:
     asio_context():
         _self{std::in_place},
         _ctx{*_self},
-        _guard{ __io::make_work_guard(_ctx) } 
+        _guard{std::in_place, __io::make_work_guard(_ctx) } 
     {}
 
     asio_context(__io::io_context& ctx):
-        _ctx{ctx},
-        _guard{ __io::make_work_guard(_ctx) } 
+        _ctx{ctx}
     {}
 
     asio_context(const asio_context&) = delete;
@@ -112,9 +111,9 @@ public:
     const __io::io_context& get_executor()const noexcept { return _ctx; }
 
 private:
-    std::optional<__io::io_context> _self;
+    std::optional<__io::io_context> _self{};
     __io::io_context &_ctx;
-    __io::executor_work_guard<__io::io_context::executor_type> _guard;
+    std::optional<__io::executor_work_guard<__io::io_context::executor_type>> _guard{};
     std::thread _th{};
 };
 
