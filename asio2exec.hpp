@@ -628,11 +628,6 @@ struct __conv {
 template <class _Fn>
 __conv(_Fn) -> __conv<_Fn>;
 
-template<class T>
-constexpr const char *__type_name(){
-    return __PRETTY_FUNCTION__;
-}
-
 template<class ...Args>
 struct __sender{
     using sender_concept = __ex::sender_t;

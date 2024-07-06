@@ -8,7 +8,14 @@ endif()
 project ("asio2exec")
 
 set(CMAKE_CXX_STANDARD 23)
-set(CMAKE_CXX_FLAGS "-fconcepts-diagnostics-depth=4 -pthread -Wnon-template-friend ${CMAKE_CXX_FLAGS}")
+
+add_library(example_flags INTERFACE)
+target_compile_options(example_flags INTERFACE
+                       $<$<COMPILE_LANG_AND_ID:CXX,GNU>:-fconcepts-diagnostics-depth=10 -Wno-non-template-friend -Wall -fcoroutines>
+                       )
+target_compile_options(example_flags INTERFACE
+                       $<$<COMPILE_LANG_AND_ID:CXX,MSVC>:/Zc:__cplusplus /Zc:preprocessor /wd4100 /wd4101 /wd4127 /wd4324 /wd4456 /wd4459>
+                       )
 
 if(NOT EXISTS "${CMAKE_SOURCE_DIR}/stdexec")
     message(STATUS "Cloning stdexec.")
@@ -35,6 +42,7 @@ foreach(EXAMPLE_SOURCE ${EXAMPLE_SOURCES})
     target_include_directories(${EXAMPLE_NAME} PUBLIC "asio/asio/include")
     target_include_directories(${EXAMPLE_NAME} PUBLIC "stdexec/include")
     target_include_directories(${EXAMPLE_NAME} PUBLIC ".")
+    target_link_libraries(${EXAMPLE_NAME} example_flags)
 endforeach()
 
 
