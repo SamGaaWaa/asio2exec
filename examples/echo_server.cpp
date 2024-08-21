@@ -38,9 +38,9 @@ int main(int argc, char **argv){
                 ex::then([&](asio::ip::tcp::socket socket){
                     auto echo_work = ex::just(std::move(socket), std::array<char, 1024>{}, asio::steady_timer{ctx.get_executor()}) |
                                     ex::let_value([](asio::ip::tcp::socket& s, std::array<char, 1024>& buf, asio::steady_timer& timer){
-                                        timer.expires_after(std::chrono::seconds(15));
                                         return  ex::just() |
                                                 ex::let_value([&]{
+                                                    timer.expires_after(std::chrono::seconds(15));
                                                     return  exec::when_any(
                                                                 s.async_read_some(asio::buffer(buf.data(), buf.size()), use_sender),
                                                                 timer.async_wait(use_sender) | ex::let_value([](auto){ return ex::just_stopped(); })
