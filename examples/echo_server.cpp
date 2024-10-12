@@ -78,7 +78,7 @@ int main(int argc, char **argv){
                                                 exec::repeat_effect_until();
                                     });
 
-                    ex::start_detached(ex::on(sched, std::move(echo_work)));
+                    ex::start_detached(ex::starts_on(sched, std::move(echo_work)));
                     return !acceptor.is_open();
                 }) |
                 ex::upon_error([](auto){

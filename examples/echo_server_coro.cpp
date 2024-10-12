@@ -99,7 +99,7 @@ exec::task<void> echo_server(asio_context& ctx, std::string_view ip, int port){
             );
             if(ec)
                 throw asio::system_error{ec};
-            ex::start_detached(ex::on(sched, session(ctx, std::move(sock))));
+            ex::start_detached(ex::starts_on(sched, session(ctx, std::move(sock))));
         }
     }catch(const asio::system_error& e){
         std::cerr << "Accept error:" << e.what() << '\n';

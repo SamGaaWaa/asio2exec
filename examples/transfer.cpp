@@ -22,7 +22,7 @@ int main(){
                 ex::then([](asio::error_code ec){
                     std::cout << "Running in main thread:" << std::this_thread::get_id() << std::endl;
                 }) |
-                ex::transfer(ctx.get_scheduler()) |
+                ex::continues_on(ctx.get_scheduler()) |
                 ex::then([]{
                     std::cout << "Running in io context thread:" << std::this_thread::get_id() << std::endl;
                 });
