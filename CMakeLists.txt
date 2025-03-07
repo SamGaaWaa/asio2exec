@@ -7,6 +7,7 @@ endif()
 
 project ("asio2exec")
 
+set(CMAKE_CXX_STANDARD_REQUIRED TRUE)
 set(CMAKE_CXX_STANDARD 23)
 
 add_library(example_flags INTERFACE)

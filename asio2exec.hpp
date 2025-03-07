@@ -200,6 +200,10 @@ struct scheduler_t {
     {}
 
     bool operator==(const scheduler_t&)const noexcept = default;
+
+    auto schedule() const noexcept {
+        return __schedule_sender_t{ _ctx };
+    }
 private:
     struct __schedule_sender_t {
         using sender_concept = __ex::sender_t;
@@ -214,8 +218,8 @@ private:
         struct __env_t {
             __io::io_context* _ctx;
             template<class CPO>
-            friend scheduler_t tag_invoke(__ex::get_completion_scheduler_t<CPO>, const __env_t& self)noexcept {
-                return scheduler_t{*self._ctx};
+            auto query(__ex::get_completion_scheduler_t<CPO>) const noexcept {
+                return scheduler_t{ *_ctx };
             }
         };
         
@@ -247,39 +251,36 @@ private:
 
             __sbo_buffer<128> _buf{};
 
-            friend void tag_invoke(__ex::start_t, __op& self)noexcept{
+            void start() & noexcept{
                 if constexpr(!__ex::unstoppable_token<__ex::stop_token_of_t<__ex::env_of_t<R>>>){
-                    const __ex::stoppable_token auto st = __ex::get_stop_token(__ex::get_env(self._r));
+                    const __ex::stoppable_token auto st = __ex::get_stop_token(__ex::get_env(_r));
                     if(st.stop_requested()){
-                        __ex::set_stopped(std::move(self._r));
+                        __ex::set_stopped(std::move(_r));
                         return;
                     }
                 }
                 try{
-                    __io::post(*self._ctx,__sched_task_t{
-                        .self{&self},
-                        .allocator{&self._buf}
+                    __io::post(*_ctx,__sched_task_t{
+                        .self{this},
+                        .allocator{&_buf}
                     });
                 }
                 catch (...) {
-                    __ex::set_error(std::move(self._r), std::current_exception());
+                    __ex::set_error(std::move(_r), std::current_exception());
                 }
             }
         };
 
         template<__ex::receiver R>
-        friend auto tag_invoke(__ex::connect_t, __schedule_sender_t self, R&& r)noexcept {
-            return __schedule_sender_t::__op<std::decay_t<R>>{ self._ctx, std::forward<R>(r) };
+        auto connect(R&& r) noexcept {
+            return __op<std::decay_t<R>>{ _ctx, std::forward<R>(r) };
         }
 
-        friend auto tag_invoke(__ex::get_env_t, const __schedule_sender_t& self)noexcept {
-            return __schedule_sender_t::__env_t{ self._ctx };
+        __env_t query(__ex::get_env_t) const noexcept {
+            return __env_t{ _ctx };
         }
+
     };
-
-    friend auto tag_invoke(__ex::schedule_t, scheduler_t self)noexcept {
-        return __schedule_sender_t{ self._ctx };
-    }
 
     __io::io_context* _ctx;
 };
@@ -614,24 +615,6 @@ constexpr decltype(auto) __unwrap_tuple(T&& t)noexcept{
     return std::make_tuple(std::forward<T>(t));
 }
 
-template <class _Fn>
-    requires std::is_nothrow_move_constructible_v<_Fn>
-struct __conv {
-    _Fn __fn_;
-    using __t = std::invoke_result_t<_Fn>;
-
-    operator __t() && noexcept(std::is_nothrow_invocable_v<_Fn>) {
-        return ((_Fn&&) __fn_)();
-    }
-
-    __t operator()() && noexcept(std::is_nothrow_invocable_v<_Fn>) {
-        return ((_Fn&&) __fn_)();
-    }
-};
-
-template <class _Fn>
-__conv(_Fn) -> __conv<_Fn>;
-
 template<class ...Args>
 struct __sender{
     using sender_concept = __ex::sender_t;
@@ -737,34 +720,34 @@ struct __sender{
             __operation_base<R>::complete(std::move(args)...);
         }
 
-        friend void tag_invoke(__ex::start_t, __operation& self)noexcept
+        void start() & noexcept
         {
-            const auto st = __ex::get_stop_token(__ex::get_env(self._r));
+            const auto st = __ex::get_stop_token(__ex::get_env(this->_r));
             if(st.stop_requested()){
-                self.__stop();
+                this->__stop();
                 return;
             }
-            self._stop_callback.emplace(st, __stop_t{&self});
+            _stop_callback.emplace(st, __stop_t{this});
             __state_t expected = __state_t::construction;
-            if(!self._state.compare_exchange_strong(expected, __state_t::emplaced, std::memory_order_acq_rel)){
-                self._stop_callback.reset();
-                self.__stop();
+            if(!_state.compare_exchange_strong(expected, __state_t::emplaced, std::memory_order_acq_rel)){
+                _stop_callback.reset();
+                this->__stop();
                 return;
             }
             //初始化IO
             try{
-                self.__init();
+                this->__init();
             }catch(...){
-                self._stop_callback.reset();
-                self.__error();
+                _stop_callback.reset();
+                this->__error();
                 return;
             }
             // 如果没有请求取消，self._state == __state_t::emplaced
             expected = __state_t::emplaced;
-            if(!self._state.compare_exchange_strong(expected, __state_t::initiated, std::memory_order_acq_rel)){
+            if(!_state.compare_exchange_strong(expected, __state_t::initiated, std::memory_order_acq_rel)){
                 // 已经请求取消，但stop_callback不会发出取消信号（见__stop_t的if分支）
-                self._stop_callback.reset();
-                self._signal.emit(__io::cancellation_type_t::total);
+                _stop_callback.reset();
+                _signal.emit(__io::cancellation_type_t::total);
                 return;
             }
         }
@@ -776,12 +759,12 @@ struct __sender{
             : __operation_base<R>(std::move(i), std::move(r))
         {}
         
-        friend void tag_invoke(__ex::start_t, __asio_op_without_cancellation& self)noexcept{
+        void start() & noexcept{
             try {
-                self.__init();
+                this->__init();
             }
             catch (...) {
-                self.__error();
+                this->__error();
             }
         }
     };
@@ -802,27 +785,27 @@ struct __sender{
                 : __operation_base<R>(std::move(i), std::move(r))
             {}
 
-            friend void tag_invoke(__ex::start_t, __transfer_op_without_cancellation& self)noexcept
+            void start() & noexcept
             {
                 try {
-                    self.__init();
+                    this->__init();
                 }
                 catch (...) {
-                    self.__error();
+                    this->__error();
                 }
             }
         };
 
         template<__ex::receiver R>
-        friend __ex::operation_state auto tag_invoke(__ex::connect_t, __transfer_sender&& self, R&& r){
+        __ex::operation_state auto connect(R&& r) && {
             if constexpr(__ex::unstoppable_token<__ex::stop_token_of_t<__ex::env_of_t<R>>>){
                 return __transfer_op_without_cancellation<std::decay_t<R>>(
-                    std::move(self._init),
+                    std::move(this->_init),
                     std::forward<R>(r)
                 );
             }else{
                 return __operation<std::decay_t<R>>(
-                    std::move(self._init),
+                    std::move(this->_init),
                     std::forward<R>(r)
                 );
             }
@@ -830,23 +813,23 @@ struct __sender{
     };
 
     template<__ex::receiver R>
-    friend __ex::operation_state auto tag_invoke(__ex::connect_t, __sender&& self, R&& r)
+    __ex::operation_state auto connect(R&& r) &&
     {
         auto env = __ex::get_env(r);
         if constexpr(requires { __ex::get_scheduler(env); }){
             return __ex::connect(
-                __ex::continues_on(__transfer_sender{._init{std::move(self._init)}}, __ex::get_scheduler(env)),
+                __ex::continues_on(__transfer_sender{._init{std::move(this->_init)}}, __ex::get_scheduler(env)),
                 std::forward<R>(r)
             );
         }else{
             if constexpr(__ex::unstoppable_token<__ex::stop_token_of_t<__ex::env_of_t<R>>>){
                 return __asio_op_without_cancellation<std::decay_t<R>>(
-                    std::move(self._init),
+                    std::move(this->_init),
                     std::forward<R>(r)
                 );
             }else{
                 return __operation<std::decay_t<R>>(
-                    std::move(self._init),
+                    std::move(this->_init),
                     std::forward<R>(r)
                 );
             }
@@ -863,6 +846,8 @@ template<class ...Args>
 using sender = __detail::__sender<Args...>;
 
 using scheduler = __detail::scheduler_t;
+
+static_assert(__ex::scheduler<scheduler>);
 
 }// asio2exec
 
