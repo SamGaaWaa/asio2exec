@@ -154,7 +154,7 @@ inline constexpr use_sender_t use_sender{};
 
 namespace __detail {
 
-template<size_t Size = 64ull, size_t Alignment = 16>
+template<size_t Size = 64ull, size_t Alignment = alignof(std::max_align_t)>
 class __sbo_buffer final: public std::pmr::memory_resource {
 public:
     explicit __sbo_buffer(std::pmr::memory_resource* upstream =  std::pmr::get_default_resource())noexcept:
@@ -276,7 +276,7 @@ private:
             return __op<std::decay_t<R>>{ _ctx, std::forward<R>(r) };
         }
 
-        __env_t query(__ex::get_env_t) const noexcept {
+        __env_t get_env() const noexcept {
             return __env_t{ _ctx };
         }
 
@@ -523,7 +523,7 @@ inline const ValueType * unsafe_any_cast(const basic_any<OptimizeForSize, Optimi
 
 template<class ...Args>
 struct __initializer{
-    using __any_t = basic_any<256, 16>; 
+    using __any_t = basic_any<256, alignof(std::max_align_t)>;
 private:
     struct __init_base{
         virtual void init(use_sender_handler_base<Args...>&&) = 0;
@@ -629,7 +629,7 @@ struct __sender{
     struct __operation_base: __op_base<Args...> {
         using __storage_t = std::variant<
             __initializer<Args...>, 
-            __sbo_buffer<512, 64>
+            __sbo_buffer<512>
         >;
 
         __storage_t _storage;
@@ -643,7 +643,7 @@ struct __sender{
             return std::get<0>(_storage);
         }
 
-        __sbo_buffer<512, 64>& __emplace_buffer()noexcept{
+        __sbo_buffer<512>& __emplace_buffer()noexcept{
             return _storage.template emplace<1>();
         }
 
