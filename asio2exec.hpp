@@ -670,15 +670,19 @@ struct __sender{
         }
 
         void complete(Args ...args)noexcept override{
-            const auto& res = std::tie(args...);
-            const auto& may_be_ec = __unwrap_first(res);
-            if constexpr(requires { may_be_ec == std::errc::operation_canceled; }){
-                if(may_be_ec == std::errc::operation_canceled){
-                    __stop();
-                    return;
+            if constexpr (sizeof...(args) == 0) {
+                __ex::set_value(std::move(_r));
+            } else {
+                const auto& res = std::tie(args...);
+                const auto& may_be_ec = __unwrap_first(res);
+                if constexpr(requires { may_be_ec == std::errc::operation_canceled; }){
+                    if(may_be_ec == std::errc::operation_canceled){
+                        __stop();
+                        return;
+                    }
                 }
+                __ex::set_value(std::move(_r), std::move(args)...);
             }
-            __ex::set_value(std::move(_r), std::move(args)...);
         }
     };
 
