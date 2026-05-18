@@ -195,6 +195,8 @@ private:
 };
 
 struct scheduler_t {
+    using scheduler_concept = __ex::scheduler_tag;
+
     explicit scheduler_t(__io::io_context& ctx)noexcept:
         _ctx{&ctx}
     {}
@@ -206,7 +208,7 @@ struct scheduler_t {
     }
 private:
     struct __schedule_sender_t {
-        using sender_concept = __ex::sender_t;
+        using sender_concept = __ex::sender_tag;
         using completion_signatures = __ex::completion_signatures<
             __ex::set_value_t(),
             __ex::set_error_t(std::exception_ptr),
@@ -225,6 +227,8 @@ private:
         
         template<__ex::receiver R>
         struct __op {
+            using operation_state_concept = __ex::operation_state_tag;
+
             __io::io_context* _ctx;
             R _r;
 
@@ -523,7 +527,7 @@ inline const ValueType * unsafe_any_cast(const basic_any<OptimizeForSize, Optimi
 
 template<class ...Args>
 struct __initializer{
-    using __any_t = basic_any<256, alignof(std::max_align_t)>;
+    using __any_t = basic_any<512, alignof(std::max_align_t)>;
 private:
     struct __init_base{
         virtual void init(use_sender_handler_base<Args...>&&) = 0;
@@ -617,7 +621,7 @@ constexpr decltype(auto) __unwrap_tuple(T&& t)noexcept{
 
 template<class ...Args>
 struct __sender{
-    using sender_concept = __ex::sender_t;
+    using sender_concept = __ex::sender_tag;
     using completion_signatures = __ex::completion_signatures<
         __ex::set_value_t(Args...),
         __ex::set_error_t(std::exception_ptr),
@@ -627,6 +631,8 @@ struct __sender{
 
     template<__ex::receiver R>
     struct __operation_base: __op_base<Args...> {
+        using operation_state_concept = __ex::operation_state_tag;
+
         using __storage_t = std::variant<
             __initializer<Args...>, 
             __sbo_buffer<512>
@@ -678,6 +684,8 @@ struct __sender{
 
     template<__ex::receiver R>
     struct __operation final: __operation_base<R> {
+        using operation_state_concept = __ex::operation_state_tag;
+
         __operation(__initializer<Args...>&& i, R&& r)
             : __operation_base<R>(std::move(i), std::move(r))
         {}
@@ -755,6 +763,8 @@ struct __sender{
 
     template<__ex::receiver R>
     struct __asio_op_without_cancellation final: __operation_base<R> {
+        using operation_state_concept = __ex::operation_state_tag;
+
         __asio_op_without_cancellation(__initializer<Args...>&& i, R&& r)
             : __operation_base<R>(std::move(i), std::move(r))
         {}
@@ -770,7 +780,7 @@ struct __sender{
     };
 
     struct __transfer_sender {
-        using sender_concept = __ex::sender_t;
+        using sender_concept = __ex::sender_tag;
         using completion_signatures = __ex::completion_signatures<
             __ex::set_value_t(Args...),
             __ex::set_error_t(std::exception_ptr),
@@ -781,6 +791,8 @@ struct __sender{
 
         template<__ex::receiver R>
         struct __transfer_op_without_cancellation final: __operation_base<R> {
+            using operation_state_concept = __ex::operation_state_tag;
+
             __transfer_op_without_cancellation(__initializer<Args...>&& i, R&& r)
                 : __operation_base<R>(std::move(i), std::move(r))
             {}

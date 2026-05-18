@@ -1,4 +1,5 @@
 #include "stdexec/execution.hpp"
+#include "exec/start_detached.hpp"
 #include "asio2exec.hpp"
 #include "asio/steady_timer.hpp"
 #include <iostream>
@@ -19,6 +20,6 @@ int main() {
                                 std::cout << "Hello World\n";
                             });
     
-    ex::start_detached(ex::starts_on(sched, std::move(work)));
+    exec::start_detached(ex::starts_on(sched, std::move(work)));
     ctx.run();
 }

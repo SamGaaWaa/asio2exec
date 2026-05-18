@@ -1,6 +1,7 @@
 #include "stdexec/execution.hpp"
 #include "exec/when_any.hpp"
-#include "exec/repeat_effect_until.hpp"
+#include "exec/repeat_until.hpp"
+#include "exec/start_detached.hpp"
 #include "asio2exec.hpp"
 #include "asio/steady_timer.hpp"
 #include "asio/ip/tcp.hpp"
@@ -75,10 +76,10 @@ int main(int argc, char **argv){
                                                     std::cerr << "Time out.\n";
                                                     return true;
                                                 }) |
-                                                exec::repeat_effect_until();
+                                                exec::repeat_until();
                                     });
 
-                    ex::start_detached(ex::starts_on(sched, std::move(echo_work)));
+                    exec::start_detached(ex::starts_on(sched, std::move(echo_work)));
                     return !acceptor.is_open();
                 }) |
                 ex::upon_error([](auto){
@@ -89,7 +90,7 @@ int main(int argc, char **argv){
                     std::cerr << "Exited.\n";
                     return true;
                 }) |
-                exec::repeat_effect_until();
+                exec::repeat_until();
 
                 
     asio::signal_set signals{ctx.get_executor()};
