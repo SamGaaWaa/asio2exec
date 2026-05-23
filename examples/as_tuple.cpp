@@ -1,19 +1,21 @@
-#include "stdexec/execution.hpp"
-#include "exec/when_any.hpp"
+#include <stdexec/execution.hpp>
+#include <exec/when_any.hpp>
+#include <exec/start_detached.hpp>
+#include <asio/signal_set.hpp>
+#include <asio/as_tuple.hpp>
+
 #include "asio2exec.hpp"
-#include "asio/signal_set.hpp"
-#include "asio/as_tuple.hpp"
+
 #include <iostream>
 
 namespace ex = stdexec;
 using namespace asio2exec;
 
 int main() {
-    asio_context ctx;
-    ctx.start();
+    asio::io_context ctx;
 
-    asio::signal_set signals{ctx.get_executor()};
-    
+    asio::signal_set signals{ctx};
+
     signals.add(SIGINT);
     signals.add(SIGTERM);
 #if defined(SIGQUIT)
@@ -25,5 +27,6 @@ int main() {
                     std::cout << "\nHello World\n";
                 });
     std::cout << "Type \"Ctrl + C\".\n";
-    ex::sync_wait(std::move(work));
+    exec::start_detached(std::move(work));
+    ctx.run();
 }

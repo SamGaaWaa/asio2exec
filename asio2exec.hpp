@@ -61,19 +61,19 @@ namespace __io = asio;
 namespace __io = boost::asio;
 #endif
 
-namespace __detail{ 
-    struct scheduler_t; 
+namespace __detail{
+    struct scheduler_t;
 }
 
 class asio_context {
     friend struct __detail::scheduler_t;
 public:
     using scheduler_t = __detail::scheduler_t;
-    
+
     asio_context():
         _self{std::in_place},
         _ctx{*_self},
-        _guard{std::in_place, __io::make_work_guard(_ctx) } 
+        _guard{std::in_place, __io::make_work_guard(_ctx) }
     {}
 
     asio_context(__io::io_context& ctx):
@@ -117,14 +117,15 @@ private:
     std::thread _th{};
 };
 
-struct use_sender_t 
+template <bool TypeErased = false>
+struct basic_use_sender_t
 {
-    constexpr use_sender_t() {}
+    constexpr basic_use_sender_t() {}
 
     template<class InnerExecutor>
-    struct executor_with_default : InnerExecutor 
+    struct executor_with_default : InnerExecutor
     {
-        using default_completion_token_type = use_sender_t;
+        using default_completion_token_type = basic_use_sender_t;
 
         executor_with_default(const InnerExecutor& ex)noexcept : InnerExecutor(ex) {}
 
@@ -142,7 +143,7 @@ struct use_sender_t
     static typename std::decay_t<T>::template rebind_executor<
         executor_with_default<typename std::decay_t<T>::executor_type>
     >::other
-        as_default_on(T&& obj) 
+        as_default_on(T&& obj)
     {
         return typename std::decay_t<T>::template rebind_executor<
             executor_with_default<typename std::decay_t<T>::executor_type>
@@ -150,7 +151,11 @@ struct use_sender_t
     }
 };
 
+using use_sender_t = basic_use_sender_t<false>;
+using use_any_sender_t = basic_use_sender_t<true>;
+
 inline constexpr use_sender_t use_sender{};
+inline constexpr use_any_sender_t use_any_sender{};
 
 namespace __detail {
 
@@ -224,7 +229,7 @@ private:
                 return scheduler_t{ *_ctx };
             }
         };
-        
+
         template<__ex::receiver R>
         struct __op {
             using operation_state_concept = __ex::operation_state_tag;
@@ -297,8 +302,8 @@ struct __op_base{
     __op_base& operator=(const __op_base&) = delete;
     __op_base& operator=(__op_base&&) = delete;
     virtual void complete(Args ...args)noexcept{};
-};  
-    
+};
+
 template<class ...Args>
 struct use_sender_handler_base {
     using allocator_type = std::pmr::polymorphic_allocator<>;
@@ -525,8 +530,32 @@ inline const ValueType * unsafe_any_cast(const basic_any<OptimizeForSize, Optimi
     return unsafe_any_cast<ValueType>(const_cast<basic_any<OptimizeForSize, OptimizeForAlignment> *>(operand));
 }
 
+template <class Init, class ...InitArgs>
+struct __initializer {
+    template<class _Init, class ..._InitArgs>
+    explicit __initializer(_Init&& init, _InitArgs&& ...args):
+        _init{std::forward<_Init>(init)},
+        _args{std::forward<_InitArgs>(args)...}
+    {}
+
+    __initializer(const __initializer&) = delete;
+    __initializer(__initializer&&) = default;
+    __initializer& operator=(const __initializer&) = delete;
+    __initializer& operator=(__initializer&&) = default;
+
+    template <class Handler>
+    void operator()(Handler&& h) && {
+        std::apply([this, h = std::forward<Handler>(h)](InitArgs&& ...args) mutable {
+            std::move(_init)(std::move(h), std::move(args)...);
+        }, std::move(_args));
+    }
+private:
+    Init _init;
+    std::tuple<InitArgs...> _args;
+};
+
 template<class ...Args>
-struct __initializer{
+struct __any_initializer{
     using __any_t = basic_any<512, alignof(std::max_align_t)>;
 private:
     struct __init_base{
@@ -536,13 +565,9 @@ private:
 
     template<class Init, class ...InitArgs>
     struct __init_impl final: __init_base{
-        Init _init;
-        std::tuple<InitArgs...> _args;
-
         template<class _Init, class ..._InitArgs>
-        __init_impl(_Init&& init, _InitArgs&& ...args): 
-            _init{std::forward<_Init>(init)}, 
-            _args{std::forward<_InitArgs>(args)...}
+        __init_impl(_Init&& init, _InitArgs&& ...args):
+            _init(std::forward<_Init>(init), std::forward<_InitArgs>(args)...)
         {}
 
         __init_impl(const __init_impl&) = delete;
@@ -551,30 +576,30 @@ private:
         __init_impl& operator=(__init_impl&&)noexcept = default;
 
         void init(use_sender_handler_base<Args...>&& handler) override{
-            std::apply(std::move(_init), std::tuple_cat(std::make_tuple(std::move(handler)), std::move(_args)));
+            std::move(_init)(std::move(handler));
         }
 
         void init(use_sender_handler<Args...>&& handler) override{
-            std::apply(std::move(_init), std::tuple_cat(std::make_tuple(std::move(handler)), std::move(_args)));
+            std::move(_init)(std::move(handler));
         }
+    private:
+        __initializer<Init, InitArgs...> _init;
     };
 public:
     template<class Init, class ...InitArgs>
-    __initializer(Init&& init, InitArgs&& ...args){
+    __any_initializer(Init&& init, InitArgs&& ...args){
         _data = __init_impl<std::decay_t<Init>, std::decay_t<InitArgs>...>(std::forward<Init>(init), std::forward<InitArgs>(args)...);
     }
 
     template<class Init>
-    __initializer(Init&& init){
+    __any_initializer(Init&& init){
         _data = __init_impl<std::decay_t<Init>>(std::forward<Init>(init));
     }
 
-    __initializer(const __initializer&) = delete;
-    __initializer& operator=(const __initializer&) = delete;
-    
-    __initializer(__initializer&& other)noexcept:
-        _data{std::move(other._data)}
-    {}
+    __any_initializer(const __any_initializer&) = delete;
+    __any_initializer& operator=(const __any_initializer&) = delete;
+    __any_initializer(__any_initializer&&)noexcept = default;
+    __any_initializer& operator=(__any_initializer&&)noexcept = default;
 
     void operator()(use_sender_handler_base<Args...>&& handler){
         unsafe_any_cast<__init_base>(&_data)->init(std::move(handler));
@@ -590,7 +615,7 @@ private:
 template<class T>
 concept __is_tuple = requires (T&& t){
     std::get<0>(t);
-}; 
+};
 
 template<class T>
 constexpr decltype(auto) __unwrap_first(T&& t)noexcept{
@@ -619,7 +644,7 @@ constexpr decltype(auto) __unwrap_tuple(T&& t)noexcept{
     return std::make_tuple(std::forward<T>(t));
 }
 
-template<class ...Args>
+template<class Init, class ...Args>
 struct __sender{
     using sender_concept = __ex::sender_tag;
     using completion_signatures = __ex::completion_signatures<
@@ -627,25 +652,34 @@ struct __sender{
         __ex::set_error_t(std::exception_ptr),
         __ex::set_stopped_t()
     >;
-    __initializer<Args...> _init;
+    using initializer_type = Init;
+
+    __sender(initializer_type&& init) noexcept:
+        _init(std::move(init))
+    {}
+
+    __sender(__sender&&) = default;
+    __sender& operator=(__sender&&) = default;
+
+    initializer_type _init;
 
     template<__ex::receiver R>
     struct __operation_base: __op_base<Args...> {
         using operation_state_concept = __ex::operation_state_tag;
 
         using __storage_t = std::variant<
-            __initializer<Args...>, 
+            initializer_type,
             __sbo_buffer<512>
         >;
 
         __storage_t _storage;
         R _r;
 
-        __operation_base(__initializer<Args...>&& i, R&& r):
+        __operation_base(initializer_type&& i, R&& r):
             _storage{std::move(i)}, _r{std::move(r)}
         {}
 
-        __initializer<Args...>& __get_initializer()noexcept{
+        initializer_type& __get_initializer()noexcept{
             return std::get<0>(_storage);
         }
 
@@ -690,7 +724,7 @@ struct __sender{
     struct __operation final: __operation_base<R> {
         using operation_state_concept = __ex::operation_state_tag;
 
-        __operation(__initializer<Args...>&& i, R&& r)
+        __operation(initializer_type&& i, R&& r)
             : __operation_base<R>(std::move(i), std::move(r))
         {}
 
@@ -769,10 +803,10 @@ struct __sender{
     struct __asio_op_without_cancellation final: __operation_base<R> {
         using operation_state_concept = __ex::operation_state_tag;
 
-        __asio_op_without_cancellation(__initializer<Args...>&& i, R&& r)
+        __asio_op_without_cancellation(initializer_type&& i, R&& r)
             : __operation_base<R>(std::move(i), std::move(r))
         {}
-        
+
         void start() & noexcept{
             try {
                 this->__init();
@@ -791,13 +825,13 @@ struct __sender{
             __ex::set_stopped_t()
         >;
 
-        __initializer<Args...> _init;
+        initializer_type _init;
 
         template<__ex::receiver R>
         struct __transfer_op_without_cancellation final: __operation_base<R> {
             using operation_state_concept = __ex::operation_state_tag;
 
-            __transfer_op_without_cancellation(__initializer<Args...>&& i, R&& r)
+            __transfer_op_without_cancellation(initializer_type&& i, R&& r)
                 : __operation_base<R>(std::move(i), std::move(r))
             {}
 
@@ -831,7 +865,7 @@ struct __sender{
     template<__ex::receiver R>
     __ex::operation_state auto connect(R&& r) &&
     {
-        auto env = __ex::get_env(r);
+        const auto& env = __ex::get_env(r);
         if constexpr(requires { __ex::get_scheduler(env); }){
             return __ex::connect(
                 __ex::continues_on(__transfer_sender{._init{std::move(this->_init)}}, __ex::get_scheduler(env)),
@@ -859,7 +893,7 @@ struct __sender{
 inline __detail::scheduler_t asio_context::get_scheduler()noexcept { return __detail::scheduler_t{ _ctx }; }
 
 template<class ...Args>
-using sender = __detail::__sender<Args...>;
+using sender = __detail::__sender<__detail::__any_initializer<Args...>, Args...>;
 
 using scheduler = __detail::scheduler_t;
 
@@ -874,19 +908,34 @@ namespace boost::asio{
 #endif
     template<class ...Args>
     struct async_result<asio2exec::use_sender_t, void(Args...)> {
+        template<class Initiation, class ...InitArgs>
+        static auto initiate(
+            Initiation&& init,
+            asio2exec::use_sender_t,
+            InitArgs&& ...args
+        ){
+            using initializer_type = asio2exec::__detail::__initializer<std::decay_t<Initiation>, std::decay_t<InitArgs>...>;
+            return asio2exec::__detail::__sender<initializer_type, Args...>{initializer_type(
+                        std::forward<Initiation>(init),
+                        std::forward<InitArgs>(args)...
+                    )};
+        }
+    };
+
+    template<class ...Args>
+    struct async_result<asio2exec::use_any_sender_t, void(Args...)> {
         using return_type = asio2exec::sender<Args...>;
 
         template<class Initiation, class ...InitArgs>
         static return_type initiate(
             Initiation&& init,
-            asio2exec::use_sender_t,
+            asio2exec::use_any_sender_t,
             InitArgs&& ...args
         ){
-            return return_type{asio2exec::__detail::__initializer<Args...>(
+            return return_type{asio2exec::__detail::__any_initializer<Args...>(
                         std::forward<Initiation>(init),
                         std::forward<InitArgs>(args)...
                     )};
         }
-
     };
 } // asio

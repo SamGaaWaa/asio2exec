@@ -1,8 +1,9 @@
-#include "stdexec/execution.hpp"
-#include "exec/start_detached.hpp"
+#include <stdexec/execution.hpp>
+#include <exec/start_detached.hpp>
+
 #include "asio2exec.hpp"
+
 #include <iostream>
-#include <thread>
 
 namespace ex = stdexec;
 

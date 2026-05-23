@@ -1,13 +1,15 @@
-#include "stdexec/execution.hpp"
-#include "exec/when_any.hpp"
-#include "exec/task.hpp"
-#include "exec/repeat_until.hpp"
-#include "exec/start_detached.hpp"
+#include <stdexec/execution.hpp>
+#include <exec/when_any.hpp>
+#include <exec/task.hpp>
+#include <exec/repeat_until.hpp>
+#include <exec/start_detached.hpp>
+#include <asio/steady_timer.hpp>
+#include <asio/ip/tcp.hpp>
+#include <asio/write.hpp>
+#include <asio/signal_set.hpp>
+
 #include "asio2exec.hpp"
-#include "asio/steady_timer.hpp"
-#include "asio/ip/tcp.hpp"
-#include "asio/write.hpp"
-#include "asio/signal_set.hpp"
+
 #include <iostream>
 
 namespace ex = stdexec;
@@ -15,12 +17,12 @@ using namespace asio2exec;
 
 ex::sender auto stop_when(ex::sender auto snd, ex::sender auto trigger){
     return  exec::when_any(
-                std::move(snd), 
+                std::move(snd),
                 std::move(trigger)
                 | ex::let_value([](auto&...){
                     return ex::just_stopped();
                 })
-            ) | 
+            ) |
             ex::then([]<class ...Args>(Args&&...results){
                 constexpr size_t args_n = (sizeof ...(Args));
                 if constexpr(args_n == 0){
@@ -42,8 +44,8 @@ ex::sender auto stop_when(ex::sender auto snd, ex::sender auto trigger){
             });
 }
 
-exec::task<void> session(asio_context& ctx, asio::ip::tcp::socket s){
-    asio::steady_timer timer{ctx.get_executor()};
+exec::task<void> session(asio::io_context& ctx, asio::ip::tcp::socket s){
+    asio::steady_timer timer{ctx};
     std::array<char, 1024> buf;
 
     try{
@@ -80,10 +82,10 @@ exec::task<void> session(asio_context& ctx, asio::ip::tcp::socket s){
     }
 }
 
-exec::task<void> echo_server(asio_context& ctx, std::string_view ip, int port){
-    ex::scheduler auto sched = ctx.get_scheduler();
-    asio::ip::tcp::acceptor acceptor{ ctx.get_executor(), asio::ip::tcp::endpoint(asio::ip::make_address_v4(ip), port) };
-    asio::signal_set signals{ctx.get_executor()};
+exec::task<void> echo_server(asio::io_context& ctx, std::string_view ip, int port){
+    asio2exec::scheduler sched{ctx};
+    asio::ip::tcp::acceptor acceptor{ ctx, asio::ip::tcp::endpoint(asio::ip::make_address_v4(ip), port) };
+    asio::signal_set signals{ctx};
     signals.add(SIGINT);
     signals.add(SIGTERM);
 #if defined(SIGQUIT)
@@ -118,8 +120,8 @@ int main(int argc, char **argv){
     const std::string_view ip{argv[1]};
     const int port{std::atoi(argv[2])};
 
-    asio_context ctx;
-    ctx.start();
+    asio::io_context ctx;
 
-    ex::sync_wait(echo_server(ctx, ip, port));
+    exec::start_detached(ex::starts_on(asio2exec::scheduler{ctx}, echo_server(ctx, ip, port)));
+    ctx.run();
 }

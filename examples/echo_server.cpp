@@ -1,12 +1,14 @@
-#include "stdexec/execution.hpp"
-#include "exec/when_any.hpp"
-#include "exec/repeat_until.hpp"
-#include "exec/start_detached.hpp"
+#include <stdexec/execution.hpp>
+#include <exec/when_any.hpp>
+#include <exec/repeat_until.hpp>
+#include <exec/start_detached.hpp>
+#include <asio/steady_timer.hpp>
+#include <asio/ip/tcp.hpp>
+#include <asio/write.hpp>
+#include <asio/signal_set.hpp>
+
 #include "asio2exec.hpp"
-#include "asio/steady_timer.hpp"
-#include "asio/ip/tcp.hpp"
-#include "asio/write.hpp"
-#include "asio/signal_set.hpp"
+
 #include <iostream>
 
 namespace ex = stdexec;
@@ -21,11 +23,10 @@ int main(int argc, char **argv){
     const std::string_view ip{argv[1]};
     const int port{std::atoi(argv[2])};
 
-    asio_context ctx;
-    ctx.start();
+    asio::io_context ctx;
 
-    ex::scheduler auto sched = ctx.get_scheduler();
-    asio::ip::tcp::acceptor acceptor{ ctx.get_executor(), asio::ip::tcp::endpoint(asio::ip::make_address_v4(ip), port) };
+    asio2exec::scheduler sched{ctx};
+    asio::ip::tcp::acceptor acceptor{ ctx, asio::ip::tcp::endpoint(asio::ip::make_address_v4(ip), port) };
 
     auto work = ex::schedule(sched) |
                 ex::let_value([&]{
@@ -92,18 +93,16 @@ int main(int argc, char **argv){
                 }) |
                 exec::repeat_until();
 
-                
-    asio::signal_set signals{ctx.get_executor()};
+    asio::signal_set signals{ctx};
     signals.add(SIGINT);
     signals.add(SIGTERM);
 #if defined(SIGQUIT)
     signals.add(SIGQUIT);
 #endif // defined(SIGQUIT)
 
-    ex::sync_wait(exec::when_any(
+    exec::start_detached(exec::when_any(
         std::move(work),
         signals.async_wait(use_sender)
     ) | ex::into_variant());
-
-    std::cout << "Waiting detached work...\n"; 
+    ctx.run();
 }
