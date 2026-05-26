@@ -14,11 +14,11 @@ int main(){
     asio2exec::asio_context ctx;
     ctx.start();
 
-    asio::post(ctx.get_executor(), [](){
+    asio::post(ctx.context(), [](){
         std::cout << "IO context thread: " << std::this_thread::get_id() << std::endl;
     });
 
-    asio::steady_timer timer{ctx.get_executor(), std::chrono::seconds(1)};
+    asio::steady_timer timer{ctx.context(), std::chrono::seconds(1)};
 
     auto work = timer.async_wait(asio2exec::use_sender) |
                 ex::then([](asio::error_code ec){

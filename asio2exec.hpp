@@ -23,21 +23,23 @@
 #pragma once
 
 #if !defined(ASIO_TO_EXEC_USE_BOOST)
-#include "asio/async_result.hpp"
-#include "asio/error_code.hpp"
-#include "asio/io_context.hpp"
-#include "asio/cancellation_signal.hpp"
-#include "asio/associated_executor.hpp"
-#include "asio/post.hpp"
+#include <asio/any_io_executor.hpp>
+#include <asio/async_result.hpp>
+#include <asio/error_code.hpp>
+#include <asio/io_context.hpp>
+#include <asio/cancellation_signal.hpp>
+#include <asio/associated_executor.hpp>
+#include <asio/post.hpp>
 #else
-#include "boost/asio/async_result.hpp"
-#include "boost/asio/io_context.hpp"
-#include "boost/asio/cancellation_signal.hpp"
-#include "boost/asio/associated_executor.hpp"
-#include "boost/asio/post.hpp"
+#include <boost/asio/any_io_executor.hpp>
+#include <boost/asio/async_result.hpp>
+#include <boost/asio/io_context.hpp>
+#include <boost/asio/cancellation_signal.hpp>
+#include <boost/asio/associated_executor.hpp>
+#include <boost/asio/post.hpp>
 #endif
 
-#include "stdexec/execution.hpp"
+#include <stdexec/execution.hpp>
 
 #include <atomic>
 #include <cassert>
@@ -62,13 +64,160 @@ namespace __io = boost::asio;
 #endif
 
 namespace __detail{
-    struct scheduler_t;
-}
+
+template<size_t Size = 64ull, size_t Alignment = alignof(std::max_align_t)>
+class __sbo_buffer final: public std::pmr::memory_resource {
+public:
+    explicit __sbo_buffer(std::pmr::memory_resource* upstream =  std::pmr::get_default_resource())noexcept:
+        _upstream{upstream}
+    {}
+
+    __sbo_buffer(const __sbo_buffer&)=delete;
+    __sbo_buffer& operator=(const __sbo_buffer&)=delete;
+    __sbo_buffer(__sbo_buffer&&)=delete;
+    __sbo_buffer& operator=(__sbo_buffer&&)=delete;
+
+private:
+    void* do_allocate(size_t bytes, size_t alignment) override{
+        if(_used || bytes > Size || alignment > Alignment){
+            assert(_upstream && "Upstream memory_resource is empty.");
+            return _upstream->allocate(bytes, alignment);
+        }
+        _used = true;
+        return &_storage;
+    }
+
+    void do_deallocate(void* ptr, size_t bytes, size_t alignment)noexcept override {
+        if(ptr == &_storage){
+            _used = false;
+            return;
+        }
+        _upstream->deallocate(ptr, bytes, alignment);
+    }
+
+    bool do_is_equal(const std::pmr::memory_resource& other) const noexcept override{
+        return this == std::addressof(other);
+    }
+
+private:
+    std::pmr::memory_resource *_upstream;
+    bool _used = false;
+    alignas(Alignment) unsigned char _storage[Size];
+};
+
+template <class Executor = __io::any_io_executor>
+struct basic_scheduler {
+    using executor_type = Executor;
+    using scheduler_concept = __ex::scheduler_tag;
+
+    template <class _Executor>
+    explicit basic_scheduler(_Executor&& ex)noexcept:
+        _executor{std::forward<_Executor>(ex)}
+    {}
+
+    template <class ExecutionContext>
+        requires std::is_convertible_v<ExecutionContext&, __io::execution_context&>
+    explicit basic_scheduler(ExecutionContext& ctx)noexcept:
+        _executor{ctx.get_executor()}
+    {}
+
+    bool operator==(const basic_scheduler&)const noexcept = default;
+
+    auto schedule() const noexcept {
+        return __schedule_sender_t{ _executor };
+    }
+
+    executor_type get_executor() const noexcept {
+        return _executor;
+    }
+private:
+    struct __schedule_sender_t {
+        using sender_concept = __ex::sender_tag;
+        using completion_signatures = __ex::completion_signatures<
+            __ex::set_value_t(),
+            __ex::set_error_t(std::exception_ptr),
+            __ex::set_stopped_t()
+        >;
+
+        executor_type _executor;
+
+        struct __env_t {
+            executor_type executor;
+            template<class CPO>
+            auto query(__ex::get_completion_scheduler_t<CPO>) const noexcept {
+                return basic_scheduler{ executor };
+            }
+        };
+
+        template<__ex::receiver R>
+        struct __op {
+            using operation_state_concept = __ex::operation_state_tag;
+
+            executor_type _executor;
+            R _r;
+            __sbo_buffer<128> _buf{};
+
+            template<__ex::receiver _R>
+            __op(executor_type ex, _R&& r)noexcept:
+                _executor{ std::move(ex) },
+                _r{ std::forward<_R>(r) }
+            {}
+
+            __op(const __op&) = delete;
+            __op(__op&&) = delete;
+            __op& operator=(const __op&) = delete;
+            __op& operator=(__op&&) = delete;
+
+            struct __sched_task_t {
+                using allocator_type = std::pmr::polymorphic_allocator<>;
+                using executor_type = Executor;
+
+                __op *self;
+
+                allocator_type get_allocator() const noexcept { return allocator_type{&self->_buf}; }
+                executor_type get_executor() const noexcept { return self->_executor; }
+
+                void operator()()noexcept{
+                    __ex::set_value(std::move(self->_r));
+                }
+            };
+
+            void start() & noexcept{
+                if constexpr(!__ex::unstoppable_token<__ex::stop_token_of_t<__ex::env_of_t<R>>>){
+                    const __ex::stoppable_token auto st = __ex::get_stop_token(__ex::get_env(_r));
+                    if(st.stop_requested()){
+                        __ex::set_stopped(std::move(_r));
+                        return;
+                    }
+                }
+                try{
+                    __io::post(_executor, __sched_task_t{this});
+                }
+                catch (...) {
+                    __ex::set_error(std::move(_r), std::current_exception());
+                }
+            }
+        };
+
+        template<__ex::receiver R>
+        auto connect(R&& r) && {
+            return __op<std::decay_t<R>>{ std::move(_executor), std::forward<R>(r) };
+        }
+
+        __env_t get_env() const noexcept {
+            return __env_t{ _executor };
+        }
+
+    };
+
+    executor_type _executor;
+};
+
+} // namespace __detail
 
 class asio_context {
-    friend struct __detail::scheduler_t;
 public:
-    using scheduler_t = __detail::scheduler_t;
+    using scheduler_type = __detail::basic_scheduler<__io::io_context::executor_type>;
 
     asio_context():
         _self{std::in_place},
@@ -105,11 +254,12 @@ public:
             _th.join();
     }
 
-    __detail::scheduler_t get_scheduler()noexcept;
+    scheduler_type get_scheduler()noexcept {
+        return scheduler_type{_ctx};
+    }
 
-    __io::io_context& get_executor()noexcept { return _ctx; }
-    const __io::io_context& get_executor()const noexcept { return _ctx; }
-
+    __io::io_context& context()noexcept { return _ctx; }
+    const __io::io_context& context()const noexcept { return _ctx; }
 private:
     std::optional<__io::io_context> _self{};
     __io::io_context &_ctx;
@@ -158,141 +308,6 @@ inline constexpr use_sender_t use_sender{};
 inline constexpr use_any_sender_t use_any_sender{};
 
 namespace __detail {
-
-template<size_t Size = 64ull, size_t Alignment = alignof(std::max_align_t)>
-class __sbo_buffer final: public std::pmr::memory_resource {
-public:
-    explicit __sbo_buffer(std::pmr::memory_resource* upstream =  std::pmr::get_default_resource())noexcept:
-        _upstream{upstream}
-    {}
-
-    __sbo_buffer(const __sbo_buffer&)=delete;
-    __sbo_buffer& operator=(const __sbo_buffer&)=delete;
-    __sbo_buffer(__sbo_buffer&&)=delete;
-    __sbo_buffer& operator=(__sbo_buffer&&)=delete;
-
-private:
-    void* do_allocate(size_t bytes, size_t alignment) override{
-        if(_used || bytes > Size || alignment > Alignment){
-            assert(_upstream && "Upstream memory_resource is empty.");
-            return _upstream->allocate(bytes, alignment);
-        }
-        _used = true;
-        return &_storage;
-    }
-
-    void do_deallocate(void* ptr, size_t bytes, size_t alignment)noexcept override {
-        if(ptr == &_storage){
-            _used = false;
-            return;
-        }
-        _upstream->deallocate(ptr, bytes, alignment);
-    }
-
-    bool do_is_equal(const std::pmr::memory_resource& other) const noexcept override{
-        return this == std::addressof(other);
-    }
-
-private:
-    std::pmr::memory_resource *_upstream;
-    bool _used = false;
-    alignas(Alignment) unsigned char _storage[Size];
-};
-
-struct scheduler_t {
-    using scheduler_concept = __ex::scheduler_tag;
-
-    explicit scheduler_t(__io::io_context& ctx)noexcept:
-        _ctx{&ctx}
-    {}
-
-    bool operator==(const scheduler_t&)const noexcept = default;
-
-    auto schedule() const noexcept {
-        return __schedule_sender_t{ _ctx };
-    }
-private:
-    struct __schedule_sender_t {
-        using sender_concept = __ex::sender_tag;
-        using completion_signatures = __ex::completion_signatures<
-            __ex::set_value_t(),
-            __ex::set_error_t(std::exception_ptr),
-            __ex::set_stopped_t()
-        >;
-
-        __io::io_context* _ctx;
-
-        struct __env_t {
-            __io::io_context* _ctx;
-            template<class CPO>
-            auto query(__ex::get_completion_scheduler_t<CPO>) const noexcept {
-                return scheduler_t{ *_ctx };
-            }
-        };
-
-        template<__ex::receiver R>
-        struct __op {
-            using operation_state_concept = __ex::operation_state_tag;
-
-            __io::io_context* _ctx;
-            R _r;
-
-            template<__ex::receiver _R>
-            __op(__io::io_context* ctx, _R&& r)noexcept:
-                _ctx{ ctx },
-                _r{ std::forward<_R>(r) }
-            {}
-
-            __op(const __op&) = delete;
-            __op(__op&&) = delete;
-            __op& operator=(const __op&) = delete;
-            __op& operator=(__op&&) = delete;
-
-            struct __sched_task_t {
-                __op *self;
-                using allocator_type = std::pmr::polymorphic_allocator<>;
-                allocator_type allocator;
-                allocator_type get_allocator() const noexcept { return allocator; }
-                void operator()()noexcept{
-                    __ex::set_value(std::move(self->_r));
-                }
-            };
-
-            __sbo_buffer<128> _buf{};
-
-            void start() & noexcept{
-                if constexpr(!__ex::unstoppable_token<__ex::stop_token_of_t<__ex::env_of_t<R>>>){
-                    const __ex::stoppable_token auto st = __ex::get_stop_token(__ex::get_env(_r));
-                    if(st.stop_requested()){
-                        __ex::set_stopped(std::move(_r));
-                        return;
-                    }
-                }
-                try{
-                    __io::post(*_ctx,__sched_task_t{
-                        .self{this},
-                        .allocator{&_buf}
-                    });
-                }
-                catch (...) {
-                    __ex::set_error(std::move(_r), std::current_exception());
-                }
-            }
-        };
-
-        template<__ex::receiver R>
-        auto connect(R&& r) noexcept {
-            return __op<std::decay_t<R>>{ _ctx, std::forward<R>(r) };
-        }
-
-        __env_t get_env() const noexcept {
-            return __env_t{ _ctx };
-        }
-
-    };
-
-    __io::io_context* _ctx;
-};
 
 template<class ...Args>
 struct __op_base{
@@ -890,12 +905,13 @@ struct __sender{
 
 }// __detail
 
-inline __detail::scheduler_t asio_context::get_scheduler()noexcept { return __detail::scheduler_t{ _ctx }; }
-
 template<class ...Args>
 using sender = __detail::__sender<__detail::__any_initializer<Args...>, Args...>;
 
-using scheduler = __detail::scheduler_t;
+template <class Executor>
+using basic_scheduler = __detail::basic_scheduler<Executor>;
+
+using scheduler = __detail::basic_scheduler<>;
 
 static_assert(__ex::scheduler<scheduler>);
 
